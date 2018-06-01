@@ -5088,15 +5088,19 @@ HOSTS
       update_registered_instances(version_key)
       initialize_scaling_info_for_version(version_key)
 
-      # Get the desired changes in the number of AppServers.
-      delta_appservers = get_scaling_info_for_version(version_key)
+      # Get the desired changes in the number of AppServers. If the
+      # database nodes are overloaded, we forced a downscaling of 1
+      # AppServer.
+      if check_db_load
+        delta_appservers = get_scaling_info_for_version(version_key)
+      else
+        Djinn.log_warn("DB is too loaded: trimming load for #{version_key}.")
+        delta_appservers = -1
+      end
+
       if delta_appservers > 0
-        if check_db_load
-          Djinn.log_debug("Considering scaling up #{version_key}.")
-          needed_appservers += try_to_scale_up(version_key, delta_appservers)
-        else
-          Djinn.log_warn("Database are too loaded: not scaling up.")
-        end
+        Djinn.log_debug("Considering scaling up #{version_key}.")
+        needed_appservers += try_to_scale_up(version_key, delta_appservers)
       elsif delta_appservers < 0
         Djinn.log_debug("Considering scaling down #{version_key}.")
         try_to_scale_down(version_key, delta_appservers.abs)
