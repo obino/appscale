@@ -2493,13 +2493,21 @@ class Djinn
     HelperFunctions.log_and_crash(@state, WAIT_TO_CRASH)
   end
 
+  def get_all_database_nodes
+    db_nodes = []
+    @state_change_lock.synchronize {
+      @nodes.each { |node|
+        db_nodes << node.private_ip if node.is_database?
+      }
+    }
+    return db_nodes
+  end
+
   def get_all_compute_nodes
     ae_nodes = []
     @state_change_lock.synchronize {
       @nodes.each { |node|
-        if node.is_compute?
-          ae_nodes << node.private_ip
-        end
+        ae_nodes << node.private_ip if node.is_compute?
       }
     }
     return ae_nodes
@@ -5083,8 +5091,12 @@ HOSTS
       # Get the desired changes in the number of AppServers.
       delta_appservers = get_scaling_info_for_version(version_key)
       if delta_appservers > 0
-        Djinn.log_debug("Considering scaling up #{version_key}.")
-        needed_appservers += try_to_scale_up(version_key, delta_appservers)
+        if check_db_load
+          Djinn.log_debug("Considering scaling up #{version_key}.")
+          needed_appservers += try_to_scale_up(version_key, delta_appservers)
+        else
+          Djinn.log_warn("Database are too loaded: not scaling up.")
+        end
       elsif delta_appservers < 0
         Djinn.log_debug("Considering scaling down #{version_key}.")
         try_to_scale_down(version_key, delta_appservers.abs)
@@ -5536,6 +5548,26 @@ HOSTS
       }
     end
     return current_hosts
+  end
+
+  # Check load on database, to see if there is still capacity to scale or
+  # not.
+  #
+  # Returns:
+  #   A boolean to indicate if we have more capacity left.
+  def check_db_load
+    get_all_database_nodes.each { |host|
+      @cluster_stats.each { |node|
+        next if node['private_ip'] != host
+
+        # The host needs to have normalized average load less than MAX_LOAD_AVG.
+        if Float(node['loadavg']['last_1_min']) / node['cpu']['count'] > MAX_LOAD_AVG
+          Djinn.log_info("Database at #{host} is too busy.")
+          return false
+        end
+      }
+    }
+    return true
   end
 
   # Try to add an AppServer for the specified version, ensuring
