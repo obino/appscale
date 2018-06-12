@@ -17,7 +17,7 @@ fi
 
 JAVA_VERSION="java-8-openjdk"
 case "${DIST}" in
-    trusty|wheezy) JAVA_VERSION="java-7-openjdk" ;;
+    wheezy) JAVA_VERSION="java-7-openjdk" ;;
 esac
 
 export UNAME_MACHINE=$(uname -m)
@@ -163,7 +163,7 @@ EOF
 
     # On distros with systemd, the open file limit must be adjusted for each
     # service.
-    if which systemctl > /dev/null; then
+    if which systemctl > /dev/null && [ "${IN_DOCKER}" != "yes" ]; then
         mkdir -p /etc/systemd/system/nginx.service.d
         cat <<EOF > /etc/systemd/system/nginx.service.d/override.conf
 [Service]
