@@ -5110,14 +5110,15 @@ HOSTS
       update_registered_instances(version_key)
       initialize_scaling_info_for_version(version_key)
 
-      # Get the desired changes in the number of AppServers. If the
-      # database nodes are overloaded, we forced a downscaling of 1
-      # AppServer.
-      if check_db_load
-        delta_appservers = get_scaling_info_for_version(version_key)
-      else
-        Djinn.log_warn("DB is too loaded: trimming load for #{version_key}.")
-        delta_appservers = -1
+      # Get the desired changes in the number of AppServers.
+      desired_appservers = get_scaling_info_for_version(version_key)
+
+      # Now we need to check if the desired changes are possible given the
+      # current load of internal services (datastore, taskqueue, etc...)
+      delta_appservers = check_services_load(version_key, desired_appservers)
+      if delta_appservers != desired_appservers
+        Djinn.log_warn("Changed desired appservers for #{version_key} " \
+                       "from #{desired_appservers} to #{delta_appservers}.")
       end
 
       if delta_appservers > 0
@@ -5576,12 +5577,20 @@ HOSTS
     return current_hosts
   end
 
-  # Check load on database, to see if there is still capacity to scale or
-  # not.
+  # Check load on internal services, and assess if the specific
+  # application desires can be fullfilled.
+  #
+  # Args:
+  #   version_key: the project/application
+  #   delta_appservers: how many AppServers the app would like
   #
   # Returns:
-  #   A boolean to indicate if we have more capacity left.
-  def check_db_load
+  #   the number of AppServers (delta) allowed for that application
+  def check_services_load(version_key, delta_appservers)
+    # If the app is already downscaling, let it do that.
+    return delta_appservers if delta_appservers < 0
+
+    # Let's make sure we don't overload the Database nodes.
     get_all_database_nodes.each { |host|
       @cluster_stats.each { |node|
         next if node['private_ip'] != host
@@ -5589,11 +5598,11 @@ HOSTS
         # The host needs to have normalized average load less than MAX_LOAD_AVG.
         if Float(node['loadavg']['last_1_min']) / node['cpu']['count'] > MAX_LOAD_AVG
           Djinn.log_info("Database at #{host} is too busy.")
-          return false
+          return -1
         end
       }
     }
-    return true
+    return delta_appservers
   end
 
   # Try to add an AppServer for the specified version, ensuring
