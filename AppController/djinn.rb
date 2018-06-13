@@ -5410,7 +5410,7 @@ HOSTS
       if num_appservers + appservers_to_scale > max
         appservers_to_scale = max - num_appservers
       end
-    elsif current_load >= MIN_LOAD_THREASHOLD
+    elsif current_load >= MIN_LOAD_THRESHOLD
       # Application is in the sweet spot, no need to adjust number of
       # AppServers.
       appservers_to_scale = 0
@@ -5424,6 +5424,10 @@ HOSTS
       if Time.now.to_i - @last_decision[version_key] < downscale_cooldown
         Djinn.log_debug(
           "Not enough time has passed to scale down #{version_key}")
+        delta = 0
+      elsif num_appservers <= min
+        Djinn.log_debug("Not scaling down #{version_key}: already " \
+                        "at the minimum number of AppServers.")
         delta = 0
       end
     end
