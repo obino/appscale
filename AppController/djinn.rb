@@ -380,10 +380,6 @@ class Djinn
   # characters from user input.
   NOT_EMAIL_REGEX = /[^\w\d_@-]/
 
-  # An Integer that determines how many log messages we should send at a time
-  # to the AppDashboard, for later viewing.
-  LOGS_PER_BATCH = 25
-
   # An Array of Strings, where each String is an appid that corresponds to an
   # application that cannot be relocated within AppScale, because system
   # services assume that they run at a specific location.
@@ -5111,15 +5107,9 @@ HOSTS
       initialize_scaling_info_for_version(version_key)
 
       # Get the desired changes in the number of AppServers.
-      desired_appservers = get_scaling_info_for_version(version_key)
-
-      # Now we need to check if the desired changes are possible given the
-      # current load of internal services (datastore, taskqueue, etc...)
-      delta_appservers = check_services_load(version_key, desired_appservers)
-      if delta_appservers != desired_appservers
-        Djinn.log_warn("Changed desired appservers for #{version_key} " \
-                       "from #{desired_appservers} to #{delta_appservers}.")
-      end
+      delta_appservers = get_scaling_info_for_version(version_key)
+      Djinn.log_debug("Application #{version_key} wants to scale " \
+                      "#{delta_appservers} AppServers.")
 
       if delta_appservers > 0
         Djinn.log_debug("Considering scaling up #{version_key}.")
@@ -5361,17 +5351,25 @@ HOSTS
 
     # Let's make sure we have the minimum number of AppServers running.
     Djinn.log_debug("Evaluating #{version_key} for scaling.")
-    if @app_info_map[version_key]['appservers'].nil?
-      num_appservers = 0
-    else
-      num_appservers = @app_info_map[version_key]['appservers'].length
-    end
 
+    # Let's get the application parameters for scaling.
     scaling_params = version_details.fetch('automaticScaling', {})
     min = scaling_params.fetch('minTotalInstances',
                                Integer(@options['default_min_appservers']))
     max = scaling_params.fetch('maxTotalInstances',
                                Integer(@options['default_max_appservers']))
+
+    # Let's get the current number of AppServers running/pending.
+    num_appservers = 0
+    unless @app_info_map[version_key]['appservers'].nil?
+      num_appservers = @app_info_map[version_key]['appservers'].length
+      if num_appservers >= max
+        Djinn.log_info("Reached maximum allowed number of AppServers " \
+                       "for #{version_key}.")
+      end
+    end
+
+    # Ensure we have the desired minimum numbers of AppServers.
     if num_appservers < min
       Djinn.log_info(
         "#{version_key} needs #{min - num_appservers} more AppServers.")
@@ -5383,66 +5381,54 @@ HOSTS
     # if austoscale is disabled.
     return 0 if @options['autoscale'].downcase != "true"
 
-    # We need the haproxy stats to decide upon what to do.
+    # We need the haproxy stats to decide upon what to do, and we update
+    # the local stats for the application.
     total_requests_seen, total_req_in_queue, current_sessions,
       time_requests_were_seen = get_application_load_stats(version_key)
-
     if time_requests_were_seen == :no_stats
       Djinn.log_warn("Didn't see any request data - not sure whether to scale up or down.")
       return 0
+    else
+      update_request_info(version_key, total_requests_seen,
+                          time_requests_were_seen, total_req_in_queue)
     end
 
-    update_request_info(version_key, total_requests_seen,
-                        time_requests_were_seen, total_req_in_queue)
-
-    # Check if we are already at the maximum allowed.
-    if num_appservers > max
-      Djinn.log_info("Enforcing maximum number of AppServers (#{max})" \
-                     " for #{version_key}.")
-      return max - num_appservers
-    end
-
+    # Check the current load (in term of requests serviced) on the
+    # AppServers.
     allow_concurrency = version_details.fetch('threadsafe', true)
     current_load = calculate_current_load(num_appservers, current_sessions,
                                           allow_concurrency)
-    if current_load >= MAX_LOAD_THRESHOLD
-      if num_appservers == max
-        Djinn.log_info("Reached maximum allowed number of AppServers " \
-                       "for #{version_key}.")
-        return 0
-      end
-      appservers_to_scale = calculate_appservers_needed(
-          num_appservers, current_sessions, allow_concurrency)
 
+    # Calculate the desired delta number of AppServers for the
+    # application. This may be used or not depending on the current load
+    # of application and services.
+    appservers_to_scale = calculate_appservers_needed(
+        num_appservers, current_sessions, allow_concurrency)
+
+    if current_load >= MAX_LOAD_THRESHOLD
       # Let's make sure we don't get over the user define maximum.
       if num_appservers + appservers_to_scale > max
         appservers_to_scale = max - num_appservers
       end
+    elsif current_load >= MIN_LOAD_THREASHOLD
+      # Application is in the sweet spot, no need to adjust number of
+      # AppServers.
+      appservers_to_scale = 0
+    end
 
-      Djinn.log_debug("The deployment has reached its maximum load " \
-                      "threshold for #{version_key} - Advising that we " \
-                      "scale up #{appservers_to_scale} AppServers.")
-      return appservers_to_scale
-
-    elsif current_load <= MIN_LOAD_THRESHOLD
+    # Let's make sure the services can take the application desired
+    # changes in # of AppServers.
+    delta = check_services_load(version_key, appservers_to_scale)
+    if delta < 0
       downscale_cooldown = SCALEDOWN_THRESHOLD * DUTY_CYCLE
       if Time.now.to_i - @last_decision[version_key] < downscale_cooldown
         Djinn.log_debug(
           "Not enough time has passed to scale down #{version_key}")
-        return 0
+        delta = 0
       end
-      appservers_to_scale = calculate_appservers_needed(
-          num_appservers, current_sessions, allow_concurrency)
-      Djinn.log_debug("The deployment is below its minimum load threshold " \
-                      "for #{version_key} - Advising that we scale down " \
-                      "#{appservers_to_scale.abs} AppServers.")
-      return appservers_to_scale
-    else
-      Djinn.log_debug("The deployment is within the desired range of load " \
-                      "for #{version_key} - Advising that there is no need " \
-                      "to scale currently.")
-      return 0
     end
+
+    return delta
   end
 
   # Calculates the current load of the deployment based on the number of
@@ -5595,9 +5581,9 @@ HOSTS
       @cluster_stats.each { |node|
         next if node['private_ip'] != host
 
-        # The host needs to have normalized average load less than MAX_LOAD_AVG.
-        if Float(node['loadavg']['last_1_min']) / node['cpu']['count'] > MAX_LOAD_AVG
-          Djinn.log_info("Database at #{host} is too busy.")
+        load_now = Float(node['loadavg']['last_1_min']) / node['cpu']['count']
+        if load_now >= MAX_LOAD_AVG
+          Djinn.log_info("Database at #{host} has normalized load of #{load_now}.")
           return -1
         end
       }
@@ -5735,8 +5721,6 @@ HOSTS
   # Args:
   #   version_key: A String containing the version key.
   #   delta_appservers: The desired number of AppServers to remove.
-  # Returns:
-  #   A boolean indicating if an AppServer was removed.
   def try_to_scale_down(version_key, delta_appservers)
     project_id, service_id, version_id = version_key.split(
       VERSION_PATH_SEPARATOR)
@@ -5749,13 +5733,12 @@ HOSTS
       min = scaling_params.fetch('minTotalInstances',
                                  Integer(@options['default_min_appservers']))
     rescue VersionNotFound
-      min = 0
+      min = Integer(@options['default_min_appservers'])
     end
 
     if @app_info_map[version_key]['appservers'].length <= min
       Djinn.log_debug("We are already at the minimum number of AppServers " \
                       "for #{version_key}.")
-      return false
     end
 
     # Make sure we leave at least the minimum number of AppServers
@@ -5775,12 +5758,10 @@ HOSTS
           Djinn.log_info(
             "Removing an AppServer for #{version_key} #{location}.")
           num_to_remove -= 1
-          return true if num_to_remove == 0
+          return if num_to_remove == 0
         end
       }
     }
-
-    return true
   end
 
   # This function unpacks an application tarball if needed. A removal of
