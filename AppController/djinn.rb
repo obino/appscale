@@ -5753,6 +5753,7 @@ HOSTS
       Djinn.log_info("Application #{version_key} wants to downscale " \
                      "#{delta_appservers} but only #{num_to_remove} " \
                      "will be downscaled.")
+    end
 
     # Let's pick the latest compute node hosting the application and
     # remove the AppServer there, so we can try to reclaim it once it's
