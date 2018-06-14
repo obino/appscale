@@ -5576,7 +5576,7 @@ HOSTS
   #
   # Returns:
   #   the number of AppServers (delta) allowed for that application
-  def check_services_load(version_key, delta_appservers)
+  def check_services_load(_version_key, delta_appservers)
     # If the app is already downscaling, let it do that.
     return delta_appservers if delta_appservers < 0
 
