@@ -5749,21 +5749,30 @@ HOSTS
     # running.
     max_delta = @app_info_map[version_key]['appservers'].length - min
     num_to_remove = [delta_appservers, max_delta].min
+    if num_to_remove != delta_appservers
+      Djinn.log_info("Application #{version_key} wants to downscale " \
+                     "#{delta_appservers} but only #{num_to_remove} " \
+                     "will be downscaled.")
 
     # Let's pick the latest compute node hosting the application and
     # remove the AppServer there, so we can try to reclaim it once it's
     # unloaded.
     get_all_compute_nodes.reverse_each { |node_ip|
+      break if num_to_remove == 0
+
+      to_delete = []
       @app_info_map[version_key]['appservers'].each { |location|
         host, _ = location.split(":")
-        if host == node_ip
-          @app_info_map[version_key]['appservers'].delete(location)
-          @last_decision[version_key] = Time.now.to_i
-          Djinn.log_info(
-            "Removing an AppServer for #{version_key} #{location}.")
-          num_to_remove -= 1
-          return if num_to_remove == 0
-        end
+        next if host != node_ip
+
+        to_delete << location
+        num_to_remove -= 1
+        break if num_to_remove == 0
+      }
+      to_delete.each { |location|
+        @app_info_map[version_key]['appservers'].delete(location)
+        @last_decision[version_key] = Time.now.to_i
+        Djinn.log_info("Removing an AppServer for #{version_key} #{location}.")
       }
     }
   end
