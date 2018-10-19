@@ -76,24 +76,6 @@ from google.appengine.api.blobstore import datastore_blob_storage
 # safety.
 GLOBAL_API_LOCK = threading.RLock()
 
-# Set of whitelisted services that are thread-safe, and therefore do not require
-# the GLOBAL_API_LOCK when executed.
-THREAD_SAFE_SERVICES = frozenset((
-    'app_identity_service',
-    'capability_service',
-    'channel',
-    'datastore_v3',
-    'logservice',
-    'mail',
-    'memcache',
-    'remote_socket',
-    'servers',
-    'taskqueue',
-    'urlfetch',
-    'user',
-    'xmpp',
-))
-
 
 def _execute_request(request):
   """Executes an API method call and returns the response object.
@@ -127,17 +109,18 @@ def _execute_request(request):
   request_data = request_class()
   request_data.ParseFromString(request.request())
   response_data = response_class()
+  service_stub = apiproxy_stub_map.apiproxy.GetStub(service)
 
   def make_request():
-    apiproxy_stub_map.apiproxy.GetStub(service).MakeSyncCall(service,
-                                                             method,
-                                                             request_data,
-                                                             response_data,
-                                                             request_id)
+    service_stub.MakeSyncCall(service,
+                              method,
+                              request_data,
+                              response_data,
+                              request_id)
 
-  # If the service is not whitelisted in THREAD_SAFE_SERVICES, acquire
+  # If the service has not declared itself as threadsafe acquire
   # GLOBAL_API_LOCK.
-  if service in THREAD_SAFE_SERVICES:
+  if service_stub.THREADSAFE:
     make_request()
   else:
     with GLOBAL_API_LOCK:
@@ -238,9 +221,10 @@ def setup_stubs(
     search_index_path,
     taskqueue_auto_run_tasks,
     taskqueue_default_http_server,
-    uaserver_path,
     user_login_url,
     user_logout_url,
+    default_gcs_bucket_name,
+    uaserver_path,
     xmpp_path):
   """Configures the APIs hosted by this server.
 
@@ -290,18 +274,20 @@ def setup_stubs(
         be run automatically or it the must be manually triggered.
     taskqueue_default_http_server: A str containing the address of the http
         server that should be used to execute tasks.
-    uaserver_path: (AppScale-specific) A str containing the FQDN or IP address
-        of the machine that runs a UserAppServer.
     user_login_url: A str containing the url that should be used for user login.
     user_logout_url: A str containing the url that should be used for user
         logout.
+    default_gcs_bucket_name: A str, overriding the default bucket behavior.
+    uaserver_path: (AppScale-specific) A str containing the FQDN or IP address
+        of the machine that runs a UserAppServer.
     xmpp_path: (AppScale-specific) A str containing the FQDN or IP address of
         the machine that runs ejabberd, where XMPP clients should connect to.
   """
 
-  apiproxy_stub_map.apiproxy.RegisterStub(
-      'app_identity_service',
-      app_identity_stub.AppIdentityServiceStub())
+  identity_stub = app_identity_stub.AppIdentityServiceStub()
+  if default_gcs_bucket_name is not None:
+    identity_stub.SetDefaultGcsBucketName(default_gcs_bucket_name)
+  apiproxy_stub_map.apiproxy.RegisterStub('app_identity_service', identity_stub)
 
   blob_storage = datastore_blob_storage.DatastoreBlobStorage(app_id)
   apiproxy_stub_map.apiproxy.RegisterStub(
@@ -488,9 +474,10 @@ def test_setup_stubs(
     search_index_path=None,
     taskqueue_auto_run_tasks=False,
     taskqueue_default_http_server='http://localhost:8080',
-    uaserver_path='localhost',
     user_login_url='/_ah/login?continue=%s',
     user_logout_url='/_ah/login?continue=%s',
+    default_gcs_bucket_name=None,
+    uaserver_path='localhost',
     xmpp_path='localhost'):
   """Similar to setup_stubs with reasonable test defaults and recallable."""
 
@@ -523,9 +510,10 @@ def test_setup_stubs(
               search_index_path,
               taskqueue_auto_run_tasks,
               taskqueue_default_http_server,
-              uaserver_path,
               user_login_url,
               user_logout_url,
+              default_gcs_bucket_name,
+              uaserver_path,
               xmpp_path)
 
 

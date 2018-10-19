@@ -35,18 +35,19 @@
 
 
 
+import httplib
 import logging
-import json 
+import json
 import webapp2
 
 import google
+
 try:
-  from appengine_pipeline.src import pipeline
+  from google.appengine.ext.mapreduce import pipeline_base
 except ImportError:
-  pipeline = None
+  pipeline_base = None
 from google.appengine.ext.mapreduce import errors
 from google.appengine.ext.mapreduce import model
-from google.appengine.ext.mapreduce import util
 
 
 class Error(Exception):
@@ -79,12 +80,7 @@ class TaskQueueHandler(BaseHandler):
       self.response.set_status(
           403, message="Task queue handler received non-task queue request")
       return
-    self._setup()
     self.handle()
-
-  def _setup(self):
-    """Called before handle method to set up handler."""
-    pass
 
   def handle(self):
     """To be implemented by subclasses."""
@@ -93,6 +89,17 @@ class TaskQueueHandler(BaseHandler):
   def task_retry_count(self):
     """Number of times this task has been retried."""
     return int(self.request.headers.get("X-AppEngine-TaskExecutionCount", 0))
+
+  def retry_task(self):
+    """Ask taskqueue to retry this task.
+
+    Even though raising an exception can cause a task retry, it
+    will flood logs with highly visible ERROR logs. Handlers should uses
+    this method to perform controlled task retries. Only raise exceptions
+    for those deserve ERROR log entries.
+    """
+    self.response.set_status(httplib.SERVICE_UNAVAILABLE, "Retry task")
+    self.response.clear()
 
 
 class JsonHandler(BaseHandler):
@@ -179,57 +186,27 @@ class HugeTaskHandler(TaskQueueHandler):
   class _RequestWrapper(object):
     def __init__(self, request):
       self._request = request
-
-      self.path = self._request.path
-      self.headers = self._request.headers
-
-      self._encoded = True
-
-      if (not self._request.get(util.HugeTask.PAYLOAD_PARAM) and
-          not self._request.get(util.HugeTask.PAYLOAD_KEY_PARAM)):
-        self._encoded = False
-        return
-      self._params = util.HugeTask.decode_payload(
-          {util.HugeTask.PAYLOAD_PARAM:
-           self._request.get(util.HugeTask.PAYLOAD_PARAM),
-           util.HugeTask.PAYLOAD_KEY_PARAM:
-           self._request.get(util.HugeTask.PAYLOAD_KEY_PARAM)})
+      self._params = model.HugeTask.decode_payload(request)
 
     def get(self, name, default=""):
-      if self._encoded:
-        return self._params.get(name, default)
-      else:
-        return self._request.get(name, default)
+      return self._params.get(name, default)
 
     def set(self, name, value):
-      if self._encoded:
-        self._params.set(name, value)
-      else:
-        self._request.set(name, value)
+      self._params[name] = value
+
+    def __getattr__(self, name):
+      return getattr(self._request, name)
 
   def __init__(self, *args, **kwargs):
     super(HugeTaskHandler, self).__init__(*args, **kwargs)
 
-  def _setup(self):
-    super(HugeTaskHandler, self)._setup()
+  def initialize(self, request, response):
+    super(HugeTaskHandler, self).initialize(request, response)
     self.request = self._RequestWrapper(self.request)
 
 
+if pipeline_base:
 
-_DEFAULT_BASE_PATH = "/_ah/mapreduce"
-_DEFAULT_PIPELINE_BASE_PATH = _DEFAULT_BASE_PATH + "/pipeline"
-
-
-if pipeline:
-  class PipelineBase(pipeline.Pipeline):
-    """Base class for all pipelines within mapreduce framework.
-
-    Rewrites base path to use pipeline library bundled with mapreduce.
-    """
-
-    def start(self, **kwargs):
-      if "base_path" not in kwargs:
-        kwargs["base_path"] = _DEFAULT_PIPELINE_BASE_PATH
-      return pipeline.Pipeline.start(self, **kwargs)
+  PipelineBase = pipeline_base.PipelineBase
 else:
   PipelineBase = None

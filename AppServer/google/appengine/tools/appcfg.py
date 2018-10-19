@@ -81,6 +81,11 @@ from google.appengine.tools import sdk_update_checker
 LIST_DELIMITER = '\n'
 TUPLE_DELIMITER = '|'
 BACKENDS_ACTION = 'backends'
+BACKENDS_MESSAGE = ('Looks like you\'re using Backends. We suggest that you '
+                    'make the switch to App Engine Modules. See the Modules '
+                    'documentation to learn more about converting: '
+                    'https://developers.google.com/appengine/docs/python/'
+                    'modules/converting')
 
 
 MAX_LOG_LEVEL = 4
@@ -108,7 +113,7 @@ SDK_PRODUCT = 'appcfg_py'
 DAY = 24*3600
 SUNDAY = 6
 
-SUPPORTED_RUNTIMES = ('go', 'python', 'python27')
+SUPPORTED_RUNTIMES = ('go', 'php', 'python', 'python27')
 
 
 
@@ -143,6 +148,12 @@ class Error(Exception):
 
 class OAuthNotAvailable(Error):
   """The appengine_rpc_httplib2 module could not be imported."""
+  pass
+
+
+class CannotStartServingError(Error):
+  """We could not start serving the version being uploaded."""
+  pass
 
 
 def PrintUpdate(msg):
@@ -1574,6 +1585,14 @@ class AppVersionUpload(object):
       result += ', version: %s' % self.version
     return result
 
+  @staticmethod
+  def _ValidateBeginYaml(resp):
+    """Validates the given /api/appversion/create response string."""
+    response_dict = yaml.safe_load(resp)
+    if not response_dict or 'warnings' not in response_dict:
+      return False
+    return response_dict
+
   def Begin(self):
     """Begins the transaction, returning a list of files that need uploading.
 
@@ -1592,13 +1611,24 @@ class AppVersionUpload(object):
     for url in config_copy.handlers:
       handler_type = url.GetHandlerType()
       if url.application_readable:
-        if handler_type == 'static_dir':
-          url.static_dir = os.path.join(STATIC_FILE_PREFIX, url.static_dir)
-        elif handler_type == 'static_files':
-          url.static_files = os.path.join(STATIC_FILE_PREFIX, url.static_files)
-          url.upload = os.path.join(STATIC_FILE_PREFIX, url.upload)
 
-    self.Send('/api/appversion/create', payload=config_copy.ToYAML())
+
+        if handler_type == 'static_dir':
+          url.static_dir = '%s/%s' % (STATIC_FILE_PREFIX, url.static_dir)
+        elif handler_type == 'static_files':
+          url.static_files = '%s/%s' % (STATIC_FILE_PREFIX, url.static_files)
+          url.upload = '%s/%s' % (STATIC_FILE_PREFIX, url.upload)
+
+    response = self.Send(
+        '/api/appversion/create',
+        payload=config_copy.ToYAML())
+
+    result = self._ValidateBeginYaml(response)
+    if result:
+      warnings = result.get('warnings')
+      for warning in warnings:
+        StatusUpdate('WARNING: %s' % warning)
+
     self.in_transaction = True
 
     files_to_clone = []
@@ -1610,7 +1640,7 @@ class AppVersionUpload(object):
       if file_classification.IsStaticFile():
         upload_path = path
         if file_classification.IsApplicationFile():
-          upload_path = os.path.join(STATIC_FILE_PREFIX, path)
+          upload_path = '%s/%s' % (STATIC_FILE_PREFIX, path)
         blobs_to_clone.append((path, upload_path, content_hash,
                                file_classification.StaticMimeType()))
 
@@ -1693,7 +1723,7 @@ class AppVersionUpload(object):
     if file_classification.IsStaticFile():
       upload_path = path
       if file_classification.IsApplicationFile():
-        upload_path = os.path.join(STATIC_FILE_PREFIX, path)
+        upload_path = '%s/%s' % (STATIC_FILE_PREFIX, path)
       self.blob_batcher.AddToBatch(upload_path, payload,
                                    file_classification.StaticMimeType())
 
@@ -1788,6 +1818,9 @@ class AppVersionUpload(object):
 
       self.in_transaction = False
     else:
+      if result == '0':
+        raise CannotStartServingError(
+            'Another operation on this version is in progress.')
       success, unused_contents = RetryWithBackoff(
           lambda: (self.IsServing(), None), PrintRetryMessage, 1, 2, 60, 20)
       if not success:
@@ -1857,6 +1890,17 @@ class AppVersionUpload(object):
     self.started = True
     return result
 
+  @staticmethod
+  def _ValidateIsServingYaml(resp):
+    """Validates the given /isserving YAML string.
+
+    Returns the resulting dictionary if the response is valid.
+    """
+    response_dict = yaml.safe_load(resp)
+    if 'serving' not in response_dict:
+      return False
+    return response_dict
+
   def IsServing(self):
     """Check if the new app version is serving.
 
@@ -1869,8 +1913,23 @@ class AppVersionUpload(object):
     assert self.started, 'StartServing() must be called before IsServing().'
 
     StatusUpdate('Checking if updated app version is serving.')
+
+    self.params['new_serving_resp'] = '1'
     result = self.Send('/api/appversion/isserving')
-    return result == '1'
+    del self.params['new_serving_resp']
+    if result in ['0', '1']:
+      return result == '1'
+    result = AppVersionUpload._ValidateIsServingYaml(result)
+    if not result:
+      raise CannotStartServingError(
+          'Internal error: Could not parse IsServing response.')
+    message = result.get('message')
+    fatal = result.get('fatal')
+    if message:
+      StatusUpdate(message)
+    if fatal:
+      raise CannotStartServingError(fatal)
+    return result['serving']
 
   def Rollback(self):
     """Rolls back the transaction if one is in progress."""
@@ -1990,6 +2049,11 @@ class AppVersionUpload(object):
     except urllib2.HTTPError, err:
 
       logging.info('HTTP Error (%s)', err)
+      self.Rollback()
+      raise
+    except CannotStartServingError, err:
+
+      logging.error(err.message)
       self.Rollback()
       raise
     except:
@@ -2258,6 +2322,8 @@ class AppCfgApp(object):
 
 
     if action == BACKENDS_ACTION:
+
+      StatusUpdate(BACKENDS_MESSAGE)
       if len(self.args) < 1:
         RaiseParseError(action, self.actions[BACKENDS_ACTION])
 
@@ -2353,6 +2419,9 @@ class AppCfgApp(object):
       return 1
     except yaml_errors.EventListenerError, e:
       print >>self.error_fh, ('Error parsing yaml file:\n%s' % e)
+      return 1
+    except CannotStartServingError:
+      print >>self.error_fh, 'Could not start serving the given version.'
       return 1
     return 0
 
@@ -2536,8 +2605,9 @@ class AppCfgApp(object):
                 self.oauth_scopes,
                 self.options.oauth2_credential_file)
 
-      appengine_rpc_httplib2.tools.FLAGS.auth_local_webserver = (
-          self.options.auth_local_webserver)
+      if hasattr(appengine_rpc_httplib2.tools, 'FLAGS'):
+        appengine_rpc_httplib2.tools.FLAGS.auth_local_webserver = (
+            self.options.auth_local_webserver)
     else:
       if not self.rpc_server_class:
         self.rpc_server_class = appengine_rpc.HttpRpcServerWithOAuth2Suggestion
@@ -3234,6 +3304,22 @@ class AppCfgApp(object):
                               backend=backend,
                               payload=backends_yaml.ToYAML())
     print >> self.out_fh, response
+
+  def ListVersions(self):
+    """Lists all versions for an app."""
+    if self.args:
+      self.parser.error('Expected no arguments.')
+
+    appyaml = self._ParseAppInfoFromYaml(self.basepath)
+    rpcserver = self._GetRpcServer()
+    response = rpcserver.Send('/api/versions/list', app_id=appyaml.application)
+
+    parsed_response = yaml.safe_load(response)
+    if not parsed_response:
+      print >> self.out_fh, ('No versions uploaded for app: %s.' %
+                             appyaml.application)
+    else:
+      print >> self.out_fh, response
 
   def _ParseAndValidateModuleYamls(self, yaml_paths):
     """Validates given yaml paths and returns the parsed yaml objects.
@@ -3977,7 +4063,6 @@ definitions from the optional queue.yaml file."""),
 
       'update_dispatch': Action(
           function='UpdateDispatch',
-          hidden=True,
           usage='%prog [options] update_dispatch <directory>',
           short_desc='Update application dispatch definitions.',
           long_desc="""
@@ -4102,11 +4187,8 @@ Expected an optional <directory> and mandatory <output_file> argument."""),
 The 'cron_info' command will display the next 'number' runs (default 5) for
 each cron job defined in the cron.yaml file."""),
 
-
-
       'start': Action(
           function='Start',
-          hidden=True,
           uses_basepath=False,
           usage='%prog [options] start [file, ...]',
           short_desc='Start a module version.',
@@ -4115,7 +4197,6 @@ The 'start' command will put a module version into the START state."""),
 
       'stop': Action(
           function='Stop',
-          hidden=True,
           uses_basepath=False,
           usage='%prog [options] stop [file, ...]',
           short_desc='Stop a module version.',
@@ -4175,7 +4256,13 @@ The 'set_default_version' command sets the default (serving) version of the app.
 The 'resource_limits_info' command prints the current resource limits that
 are enforced."""),
 
-
+      'list_versions': Action(
+          function='ListVersions',
+          usage='%prog [options] list_versions <directory>',
+          short_desc='List all uploaded versions for an app.',
+          long_desc="""
+The 'list_versions' command outputs the uploaded versions for each module of
+an application in YAML."""),
   }
 
 

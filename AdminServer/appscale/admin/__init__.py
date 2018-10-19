@@ -8,8 +8,16 @@ import json
 import logging
 import os
 import re
+import six
 import sys
 import time
+
+try:
+  from urllib import quote as urlquote
+except ImportError:
+  from urllib.parse import quote as urlquote
+
+import requests_unixsocket
 
 from appscale.appcontroller_client import AppControllerException
 from appscale.common import appscale_info
@@ -35,10 +43,13 @@ from tornado.options import options
 from tornado import web
 from tornado.escape import json_decode
 from tornado.escape import json_encode
+from tornado.httpserver import HTTPServer
 from tornado.ioloop import IOLoop
+from tornado.netutil import bind_unix_socket
 from . import utils
 from . import constants
 from .appengine_api import UpdateCronHandler
+from .appengine_api import UpdateIndexesHandler
 from .appengine_api import UpdateQueuesHandler
 from .base_handler import BaseHandler
 from .constants import (
@@ -59,7 +70,8 @@ from .operation import (
 )
 from .operations_cache import OperationsCache
 from .push_worker_manager import GlobalPushWorkerManager
-from .service_manager import ServiceManager
+from .resource_validator import validate_resource, ResourceValidationError
+from .service_manager import ServiceManager, ServiceManagerHandler
 from .summary import get_combined_services
 
 logger = logging.getLogger('appscale-admin')
@@ -583,9 +595,9 @@ class VersionsHandler(BaseHandler):
         raise CustomHTTPError(HTTPCodes.BAD_REQUEST,
                               message='Reserved version ID')
 
-    if 'basicScaling' in version or 'manualScaling' in version:
+    if 'basicScaling' in version:
       raise CustomHTTPError(HTTPCodes.BAD_REQUEST,
-                            message='Only automaticScaling is supported')
+                            message='Invalid scaling, basicScaling is not supported')
 
     for inbound_service in version.get('inboundServices', []):
       if inbound_service not in SUPPORTED_INBOUND_SERVICES:
@@ -606,6 +618,12 @@ class VersionsHandler(BaseHandler):
         https_port not in constants.ALLOWED_HTTPS_PORTS):
       raise CustomHTTPError(HTTPCodes.BAD_REQUEST,
                             message='Invalid HTTPS port')
+
+    try:
+      validate_resource(version, 'version')
+    except ResourceValidationError as e:
+        resource_message = 'Invalid request: {}'.format(e.message)
+        raise CustomHTTPError(HTTPCodes.BAD_REQUEST, message=resource_message)
 
     return version
 
@@ -790,7 +808,8 @@ class VersionsHandler(BaseHandler):
         version['deployment']['zip']['sourceUrl'])
       raise CustomHTTPError(HTTPCodes.BAD_REQUEST, message=message)
     except constants.InvalidSource as error:
-      raise CustomHTTPError(HTTPCodes.BAD_REQUEST, message=str(error))
+      raise CustomHTTPError(HTTPCodes.BAD_REQUEST,
+                            message=six.text_type(error))
 
     new_path = utils.rename_source_archive(project_id, service_id, version)
     version['deployment']['zip']['sourceUrl'] = new_path
@@ -800,7 +819,7 @@ class VersionsHandler(BaseHandler):
     try:
       version = self.put_version(project_id, service_id, version)
     except VersionNotChanged as warning:
-      logger.info(str(warning))
+      logger.info(six.text_type(warning))
       self.stop_hosting_revision(project_id, service_id, version)
       return
     finally:
@@ -874,8 +893,16 @@ class VersionHandler(BaseVersionHandler):
       raise CustomHTTPError(HTTPCodes.BAD_REQUEST, message=message)
 
     desired_fields = update_mask.split(',')
-    supported_fields = {'appscaleExtensions.httpPort',
-                        'appscaleExtensions.httpsPort'}
+    supported_fields = {
+      'appscaleExtensions.httpPort',
+      'appscaleExtensions.httpsPort',
+      'automaticScaling.standard_scheduler_settings.max_instances',
+      'automaticScaling.standard_scheduler_settings.min_instances'}
+    mapped_fields = {
+      'automaticScaling.standard_scheduler_settings.max_instances':
+        'automaticScaling.standardSchedulerSettings.maxInstances',
+      'automaticScaling.standard_scheduler_settings.min_instances':
+        'automaticScaling.standardSchedulerSettings.minInstances'}
     for field in desired_fields:
       if field not in supported_fields:
         message = ('This operation is only supported on the following '
@@ -887,8 +914,10 @@ class VersionHandler(BaseVersionHandler):
     except ValueError:
       raise CustomHTTPError(HTTPCodes.BAD_REQUEST,
                             message='Payload must be valid JSON')
-
-    masked_version = utils.apply_mask_to_version(given_version, desired_fields)
+    rest_to_json = lambda field : mapped_fields.get(field, field)
+    masked_version = utils.apply_mask_to_version(
+      given_version,
+      list(map(rest_to_json, desired_fields)))
 
     extensions = masked_version.get('appscaleExtensions', {})
     http_port = extensions.get('httpPort', None)
@@ -923,8 +952,20 @@ class VersionHandler(BaseVersionHandler):
       raise CustomHTTPError(HTTPCodes.NOT_FOUND, message='Version not found')
 
     version = json.loads(version_json)
+
+    if 'automaticScaling' in new_fields:
+      if 'manualScaling' in version:
+        scaling_error = 'Invalid scaling update for Manual Scaling version'
+        raise CustomHTTPError(HTTPCodes.BAD_REQUEST, message=scaling_error)
+
+      (version.setdefault('automaticScaling', {})
+              .setdefault('standardSchedulerSettings',{})
+              .update(new_fields.get('automaticScaling')
+                                .get('standardSchedulerSettings',{})))
+
     new_ports = utils.assign_ports(version, new_fields, self.zk_client)
     version['appscaleExtensions'].update(new_ports)
+
     self.zk_client.set(version_node, json.dumps(version))
     return version
 
@@ -948,6 +989,37 @@ class VersionHandler(BaseVersionHandler):
 
     if https_port is not None:
       new_fields['appscaleExtensions']['httpsPort'] = https_port
+
+    yield self.thread_pool.submit(self.version_update_lock.acquire)
+    try:
+      version = self.update_version(project_id, service_id, version_id,
+                                    new_fields)
+    finally:
+      self.version_update_lock.release()
+
+    raise gen.Return(version)
+
+  @gen.coroutine
+  def update_scaling_for_version(self, project_id, service_id, version_id,
+                                 min_instances, max_instances):
+    """ Updates scaling settings for a version.
+
+    Args:
+      project_id: A string specifying a project ID.
+      service_id: A string specifying a service ID.
+      version_id: A string specifying a version ID.
+      min_instances: An integer specifying minimum instances.
+      max_instances: An integer specifying maximum instances.
+    Returns:
+      A dictionary containing completed version details.
+    """
+    new_fields = {'automaticScaling': {'standardSchedulerSettings': {}}}
+    scheduler_fields = new_fields['automaticScaling']['standardSchedulerSettings']
+    if min_instances is not None:
+      scheduler_fields['minInstances'] = min_instances
+
+    if max_instances is not None:
+      scheduler_fields['maxInstances'] = max_instances
 
     yield self.thread_pool.submit(self.version_update_lock.acquire)
     try:
@@ -1036,6 +1108,17 @@ class VersionHandler(BaseVersionHandler):
       new_https_port = extensions.get('httpsPort')
       version = yield self.relocate_version(
         project_id, service_id, version_id, new_http_port, new_https_port)
+
+    automatic_scaling = version.get('automaticScaling', {})
+    standard_settings = automatic_scaling.get(
+      'standardSchedulerSettings', {})
+    if ('minInstances' in standard_settings or
+        'maxInstances' in standard_settings):
+      new_min_instances = standard_settings.get('minInstances', None)
+      new_max_instances = standard_settings.get('maxInstances', None)
+      version = yield self.update_scaling_for_version(
+        project_id, service_id, version_id, new_min_instances,
+        new_max_instances)
 
     operation = UpdateVersionOperation(project_id, service_id, version)
     self.write(json_encode(operation.rest_repr()))
@@ -1201,12 +1284,26 @@ def main():
 
   subparsers.add_parser(
     'summary', description='Lists AppScale processes running on this machine')
+  restart_parser = subparsers.add_parser(
+    'restart',
+    description='Restart AppScale processes running on this machine')
+  restart_parser.add_argument('service', nargs='+',
+                              help='The process or service ID to restart')
 
   args = parser.parse_args()
   if args.command == 'summary':
     table = sorted(list(get_combined_services().items()))
     print(tabulate(table, headers=['Service', 'State']))
     sys.exit(0)
+
+  if args.command == 'restart':
+    socket_path = urlquote(ServiceManagerHandler.SOCKET_PATH, safe='')
+    session = requests_unixsocket.Session()
+    response = session.post(
+      'http+unix://{}/'.format(socket_path),
+      data={'command': 'restart', 'arg': [args.service]})
+    response.raise_for_status()
+    return
 
   if args.verbose:
     logger.setLevel(logging.DEBUG)
@@ -1254,10 +1351,19 @@ def main():
      {'ua_client': ua_client}),
     ('/api/cron/update', UpdateCronHandler,
      {'acc': acc, 'zk_client': zk_client, 'ua_client': ua_client}),
+    ('/api/datastore/index/add', UpdateIndexesHandler,
+     {'zk_client': zk_client, 'ua_client': ua_client}),
     ('/api/queue/update', UpdateQueuesHandler,
      {'zk_client': zk_client, 'ua_client': ua_client})
   ])
   logger.info('Starting AdminServer')
   app.listen(args.port)
+
+  management_app = web.Application([
+    ('/', ServiceManagerHandler, {'service_manager': service_manager})])
+  management_server = HTTPServer(management_app)
+  management_socket = bind_unix_socket(ServiceManagerHandler.SOCKET_PATH)
+  management_server.add_socket(management_socket)
+
   io_loop = IOLoop.current()
   io_loop.start()
