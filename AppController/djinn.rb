@@ -5578,18 +5578,25 @@ HOSTS
     # If the app is already downscaling, let it do that.
     return delta_appservers if delta_appservers < 0
 
-    # Let's make sure we don't overload the Database nodes.
+    # Let's make sure we don't overload the Database nodes. We find here
+    # the most loaded node.
+    high_load = 0.0
     get_all_database_nodes.each { |host|
       @cluster_stats.each { |node|
         next if node['private_ip'] != host
 
         load_now = Float(node['loadavg']['last_1_min']) / node['cpu']['count']
         if load_now >= MAX_LOAD_AVG
-          Djinn.log_info("Database at #{host} has normalized load of #{load_now}.")
-          return -1
+          Djinn.log_debug("Database at #{host} has normalized load of #{load_now}.")
+          high_load = load_now if load_now > high_load
         end
       }
     }
+
+    # The euristic implied here removes one AppServer per extra unit of
+    # normalized load on the most loaded datastore.
+    delta_appservers = -1 * high_load.ceil if high_load > 0
+
     return delta_appservers
   end
 
