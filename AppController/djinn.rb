@@ -5418,9 +5418,6 @@ HOSTS
           num_appservers, current_sessions, allow_concurrency)
       end
 
-      # Gets the scaling limits for this application.
-      min, max = get_min_max_appservers(version_details)
-
       # Now what we have the optimal number of AppServers the application
       # would like, we look into the current load of the application: if it
       # is already in the sweet spot, we let it be.
@@ -5428,6 +5425,9 @@ HOSTS
         appservers_to_scale = 0
       end
     end
+
+    # Gets the scaling limits for this application.
+    min, max = get_min_max_appservers(version_details)
 
     # Make sure we don't go over the maximum number of AppServers
     # indicated for this application.
