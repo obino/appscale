@@ -5625,7 +5625,7 @@ HOSTS
 
     # The euristic implied here removes one AppServer per extra unit of
     # normalized load on the most loaded datastore.
-    delta_appservers = -1 * high_load.ceil if high_load > 0
+    delta_appservers = -1 * (high_load - MAX_LOAD_AVG).ceil if high_load > 0
 
     return delta_appservers
   end
