@@ -5328,29 +5328,13 @@ HOSTS
   end
 
 
-  # Queries haproxy to see how many requests are queued for a given version
-  # and how many requests are served at a given time.
+  # Finds the limits of the autoscaling for the specific application.
   # Args:
-  #   version_key: The name of the version to get info for.
+  #   version_details: the version of the running application
   # Returns:
-  #   an Integer: the number of AppServers desired (a positive number
-  #     means we want more, a negative that we want to remove some, and 0
-  #     for no changes).
-  def get_scaling_info_for_version(version_key)
-    project_id, service_id, version_id, = version_key.split(
-      VERSION_PATH_SEPARATOR)
-    begin
-      version_details = ZKInterface.get_version_details(
-        project_id, service_id, version_id)
-    rescue VersionNotFound
-      Djinn.log_info("Not scaling app #{version_key} since we aren't " \
-                     'hosting it anymore.')
-      return 0
-    end
-
-    # Let's make sure we have the minimum number of AppServers running.
-    Djinn.log_debug("Evaluating #{version_key} for scaling.")
-
+  #   a couple: the min, max allowed values of AppServers
+  def get_min_max_appservers(version_details)
+    # Find out the scaling parameters for this application.
     manual_scaling = version_details.fetch('manualScaling', {})
     if manual_scaling.fetch('instances', nil)
       min = manual_scaling.fetch('instances')
@@ -5371,70 +5355,116 @@ HOSTS
       max = min_max_params.fetch(max_param,
                                  Integer(@options['default_max_appservers']))
     end
-    if num_appservers < min
-      Djinn.log_info(
-        "#{version_key} needs #{min - num_appservers} more AppServers.")
-      @last_decision[version_key] = 0
-      return min - num_appservers
+    return min, max
+  end
+
+
+  # Queries haproxy to see how many requests are queued for a given version
+  # and how many requests are served at a given time.
+  # Args:
+  #   version_key: The name of the version to get info for.
+  # Returns:
+  #   an Integer: the number of AppServers desired (a positive number
+  #     means we want more, a negative that we want to remove some, and 0
+  #     for no changes).
+  def get_scaling_info_for_version(version_key)
+    project_id, service_id, version_id, = version_key.split(
+      VERSION_PATH_SEPARATOR)
+    begin
+      version_details = ZKInterface.get_version_details(
+        project_id, service_id, version_id)
+    rescue VersionNotFound
+      Djinn.log_info("Not scaling app #{version_key} since we aren't " \
+                     'hosting it anymore.')
+      return 0
     end
 
-    # We only run @options['default_min_appservers'] AppServers per application
-    # if austoscale is disabled. No need to print anything here since we
-    # print log about disabled autoscale at intervals with the stats.
-    return 0 if @options['autoscale'].downcase != "true"
+    Djinn.log_debug("Evaluating #{version_key} for scaling.")
+
+    # Find out the current number of AppServers dedicated to the
+    # application.
+    num_appservers = 0
+    if !@app_info_map[version_key]['appservers'].nil?
+      num_appservers = @app_info_map[version_key]['appservers'].length
+    end
 
     # We need the haproxy stats to decide upon what to do, and we update
     # the local stats for the application.
     total_requests_seen, total_req_in_queue, current_sessions,
       time_requests_were_seen = get_application_load_stats(version_key)
+
+    # If we don't receive good stats about the application, we'll skip
+    # this round of scaling logic, but we still need to enfoce system
+    # limits, like the minimum number of AppServers.
+    appservers_to_scale = 0
     if time_requests_were_seen == :no_stats
       Djinn.log_warn("Didn't see any request data - not sure whether to scale up or down.")
-      return 0
     else
       update_request_info(version_key, total_requests_seen,
                           time_requests_were_seen, total_req_in_queue)
-    end
 
-    # Check the current load (in term of requests serviced) on the
-    # AppServers.
-    allow_concurrency = version_details.fetch('threadsafe', true)
-    current_load = calculate_current_load(num_appservers, current_sessions,
-                                          allow_concurrency)
-
-    # Calculate the desired delta number of AppServers for the
-    # application. This may be used or not depending on the current load
-    # of application and services.
-    appservers_to_scale = calculate_appservers_needed(
-        num_appservers, current_sessions, allow_concurrency)
-
-    if current_load >= MAX_LOAD_THRESHOLD
-      # Let's make sure we don't get over the user define maximum.
-      if num_appservers + appservers_to_scale > max
-        appservers_to_scale = max - num_appservers
-      end
-    elsif current_load >= MIN_LOAD_THRESHOLD
-      # Application is in the sweet spot, no need to adjust number of
+      # Check the current load (in term of requests serviced) on the
       # AppServers.
-      appservers_to_scale = 0
+      allow_concurrency = version_details.fetch('threadsafe', true)
+      current_load = calculate_current_load(num_appservers, current_sessions,
+                                            allow_concurrency)
+
+      # If 'autoscale' is disabled, we go through the system check, and obey
+      # to the minimum number of AppServers but we do no other scaling.
+      if @options['autoscale'].downcase == "true"
+        # Calculate the desired (as a difference) number of AppServers for
+        # the application.
+        appservers_to_scale = calculate_appservers_needed(
+          num_appservers, current_sessions, allow_concurrency)
+      end
+
+      # Gets the scaling limits for this application.
+      min, max = get_min_max_appservers(version_details)
+
+      # Now what we have the optimal number of AppServers the application
+      # would like, we look into the current load of the application: if it
+      # is already in the sweet spot, we let it be.
+      if current_load < MAX_LOAD_THRESHOLD && current_load > MIN_LOAD_THRESHOLD
+        appservers_to_scale = 0
+      end
     end
 
-    # Let's make sure the services can take the application desired
-    # changes in # of AppServers.
+    # Make sure we don't go over the maximum number of AppServers
+    # indicated for this application.
+    if num_appservers + appservers_to_scale > max
+      appservers_to_scale = max - num_appservers
+      if appservers_to_scale.zero?
+        Djinn.log_debug("#{version_key} has reached the maximum number of allowed " \
+                        "AppServers (#{max}).")
+      end
+    end
+
+    # Services need will override the applicaiton desires, in order to
+    # avoid overloading.
     delta = check_services_load(version_key, appservers_to_scale)
-    if delta < 0
+    appservers_to_scale = delta if delta < 0
+
+    # We downscale more slowly to smooth the response of the application
+    # over very quick jittery workloads.
+    if appservers_to_scale < 0
       downscale_cooldown = SCALEDOWN_THRESHOLD * DUTY_CYCLE
       if Time.now.to_i - @last_decision[version_key] < downscale_cooldown
         Djinn.log_debug(
           "Not enough time has passed to scale down #{version_key}")
-        delta = 0
-      elsif num_appservers <= min
-        Djinn.log_debug("Not scaling down #{version_key}: already " \
-                        "at the minimum number of AppServers.")
-        delta = 0
+        appservers_to_scale = 0
       end
     end
 
-    return delta
+    # Finally we have to ensure we have at least the minimum number of
+    # AppServers dicated by the user/administrator.
+    if num_appservers < min
+      Djinn.log_info(
+        "#{version_key} needs #{min - num_appservers} more AppServers.")
+      @last_decision[version_key] = 0
+      appservers_to_scale = [min - num_appservers, appservers_to_scale].max
+    end
+
+    return appservers_to_scale
   end
 
   # Calculates the current load of the deployment based on the number of
