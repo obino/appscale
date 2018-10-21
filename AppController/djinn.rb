@@ -5384,7 +5384,7 @@ HOSTS
     # Find out the current number of AppServers dedicated to the
     # application.
     num_appservers = 0
-    if !@app_info_map[version_key]['appservers'].nil?
+    unless @app_info_map[version_key]['appservers'].nil?
       num_appservers = @app_info_map[version_key]['appservers'].length
     end
 
