@@ -5784,9 +5784,9 @@ HOSTS
     max_delta = @app_info_map[version_key]['appservers'].length - min
     num_to_remove = [delta_appservers, max_delta].min
     if num_to_remove != delta_appservers
-      Djinn.log_info("Application #{version_key} wants to downscale " \
-                     "#{delta_appservers} but only #{num_to_remove} " \
-                     "will be downscaled.")
+      Djinn.log_debug("Application #{version_key} wants to downscale " \
+                      "#{delta_appservers} but only #{num_to_remove} " \
+                      "will be downscaled.")
     end
 
     # Let's pick the latest compute node hosting the application and
