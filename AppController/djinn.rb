@@ -2456,9 +2456,7 @@ class Djinn
   def get_all_database_nodes
     db_nodes = []
     @state_change_lock.synchronize {
-      @nodes.each { |node|
-        db_nodes << node.private_ip if node.is_database?
-      }
+      @nodes.each { |node| db_nodes << node.private_ip if node.is_database? }
     }
     return db_nodes
   end
@@ -2466,9 +2464,7 @@ class Djinn
   def get_all_compute_nodes
     ae_nodes = []
     @state_change_lock.synchronize {
-      @nodes.each { |node|
-        ae_nodes << node.private_ip if node.is_compute?
-      }
+      @nodes.each { |node| ae_nodes << node.private_ip if node.is_compute? }
     }
     return ae_nodes
   end
@@ -5097,6 +5093,11 @@ HOSTS
       end
     end
 
+    # Services need will override the applicaiton desires, in order to
+    # avoid overloading.
+    delta = check_services_load(version_key, num_appservers)
+    appservers_to_scale = delta if delta < 0
+
     # Gets the scaling limits for this application.
     min, max = get_min_max_appservers(version_details)
 
@@ -5108,15 +5109,17 @@ HOSTS
         Djinn.log_debug("#{version_key} has reached the maximum number of allowed " \
                         "AppServers (#{max}).")
       end
+    elsif num_appservers + appservers_to_scale < min
+      appservers_to_scale = num_appservers - min
+      if appservers_to_scale.zero?
+        Djinn.log_debug("#{version_key} has reached the minimum number of allowed " \
+                        "AppServers (#{max}).")
+      end
     end
 
-    # Services need will override the applicaiton desires, in order to
-    # avoid overloading.
-    delta = check_services_load(version_key, appservers_to_scale)
-    appservers_to_scale = delta if delta < 0
-
-    # We downscale more slowly to smooth the response of the application
-    # over very quick jittery workloads.
+    # We have a cooldown period for downscaling to ensure we give enough
+    # time to the stats to be representative before removing too many
+    # AppServers.
     if appservers_to_scale < 0
       downscale_cooldown = SCALEDOWN_THRESHOLD * DUTY_CYCLE
       if Time.now.to_i - @last_decision[version_key] < downscale_cooldown
@@ -5127,8 +5130,8 @@ HOSTS
     end
 
     # Finally we have to ensure we have at least the minimum number of
-    # AppServers dicated by the user/administrator.
-    if num_appservers < min
+    # AppServers required.
+    if num_appservers + appservers_to_scale < min
       Djinn.log_info(
         "#{version_key} needs #{min - num_appservers} more AppServers.")
       @last_decision[version_key] = 0
@@ -5271,32 +5274,40 @@ HOSTS
   #
   # Args:
   #   version_key: the project/application
-  #   delta_appservers: how many AppServers the app would like
+  #   num_appservers: how many AppServers the app is currently running
   #
   # Returns:
-  #   the number of AppServers (delta) allowed for that application
-  def check_services_load(_version_key, delta_appservers)
-    # If the app is already downscaling, let it do that.
-    return delta_appservers if delta_appservers < 0
-
-    # Let's make sure we don't overload the Database nodes. We find here
-    # the most loaded node.
+  #   the number of AppServers to remove (0 if load is ok)
+  def check_services_load(_version_key, num_appservers)
+    # Let's find the most loaded DB node and its load.
     high_load = 0.0
     get_all_database_nodes.each { |host|
-      @cluster_stats.each { |node|
-        next if node['private_ip'] != host
+      @state_change_lock.synchronize {
+        @cluster_stats.each { |node|
+          next if node['private_ip'] != host
 
-        load_now = Float(node['loadavg']['last_1_min']) / node['cpu']['count']
-        if load_now >= MAX_LOAD_AVG
-          Djinn.log_debug("Database at #{host} has normalized load of #{load_now}.")
-          high_load = load_now if load_now > high_load
-        end
+          load_now = Float(node['loadavg']['last_1_min']) / node['cpu']['count']
+          if load_now >= MAX_LOAD_AVG
+            Djinn.log_debug("Database at #{host} has normalized load of #{load_now}.")
+            high_load = load_now if load_now > high_load
+          end
+        }
       }
     }
 
-    # The euristic implied here removes one AppServer per extra unit of
-    # normalized load on the most loaded datastore.
-    delta_appservers = -1 * (high_load - MAX_LOAD_AVG).ceil if high_load > 0
+    # The remove about 10% of AppServers for loads above the maximum up to
+    # 2x the maximum, 50% for higher loads.
+    delta_appservers = 0
+    if high_load > 0 && high_load > MAX_LOAD_AVG && high_load < MAX_LOAD_AVG * 2
+      delta_appservers = -1 * Integer(num_appservers * 0.1)
+    elsif high_load > 0 && high_load >= MAX_LOAD_AVG * 2
+      delta_appservers = -1 * Integer(num_appservers * 0.5)
+    end
+
+    if delta_appservers < 0
+      Djinn.log_info("Asking to reduce AppServers for #{version_key} " \
+                     "because of Database load.")
+    end
 
     return delta_appservers
   end
