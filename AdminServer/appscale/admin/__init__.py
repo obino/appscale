@@ -74,7 +74,7 @@ from .resource_validator import validate_resource, ResourceValidationError
 from .service_manager import ServiceManager, ServiceManagerHandler
 from .summary import get_combined_services
 
-logger = logging.getLogger('appscale-admin')
+logger = logging.getLogger(__name__)
 
 # The state of each operation.
 operations = OperationsCache()
@@ -124,12 +124,11 @@ def wait_for_port_to_open(http_port, operation_id, deadline):
 
 
 @gen.coroutine
-def wait_for_deploy(operation_id, acc):
+def wait_for_deploy(operation_id):
   """ Tracks the progress of a deployment.
 
   Args:
     operation_id: A string specifying the operation ID.
-    acc: An AppControllerClient instance.
   Raises:
     OperationTimeout if the deadline is exceeded.
   """
@@ -508,24 +507,28 @@ class ServiceHandler(BaseVersionHandler):
 class VersionsHandler(BaseHandler):
   """ Manages service versions. """
 
+  # A rule for validating project IDs.
+  PROJECT_ID_RE = re.compile(r'^[a-z][a-z0-9\-]{5,29}$')
+
   # A rule for validating version IDs.
-  VERSION_ID_RE = re.compile(r'(?!-)[a-z\d\-]{1,100}')
+  VERSION_ID_RE = re.compile(r'^(?!-)[a-z0-9-]{0,62}[a-z0-9]$')
+
+  # A rule for validating service IDs.
+  SERVICE_ID_RE = re.compile(r'^(?!-)[a-z0-9-]{0,62}[a-z0-9]$')
+
 
   # Reserved names for version IDs.
   RESERVED_VERSION_IDS = ('^default$', '^latest$', '^ah-.*$')
 
-  def initialize(self, acc, ua_client, zk_client, version_update_lock,
-                 thread_pool):
+  def initialize(self, ua_client, zk_client, version_update_lock, thread_pool):
     """ Defines required resources to handle requests.
 
     Args:
-      acc: An AppControllerClient.
       ua_client: A UAClient.
       zk_client: A KazooClient.
       version_update_lock: A kazoo lock.
       thread_pool: A ThreadPoolExecutor.
     """
-    self.acc = acc
     self.ua_client = ua_client
     self.zk_client = zk_client
     self.version_update_lock = version_update_lock
@@ -584,11 +587,15 @@ class VersionsHandler(BaseHandler):
     # Prevent multiple versions per service.
     if version['id'] != constants.DEFAULT_VERSION:
       raise CustomHTTPError(HTTPCodes.BAD_REQUEST,
-                            message='Invalid version ID')
+                            message='AppScale currently does not support versions, '
+                                    'so you have to use default version ID, i.e. "v1"')
 
     if not self.VERSION_ID_RE.match(version['id']):
       raise CustomHTTPError(HTTPCodes.BAD_REQUEST,
-                            message='Invalid version ID')
+                            message='Invalid version ID. '
+                                    'May only contain lowercase letters, digits, '
+                                    'and hyphens. Must begin and end with a letter '
+                                    'or digit. Must not exceed 63 characters.')
 
     for reserved_id in self.RESERVED_VERSION_IDS:
       if re.match(reserved_id, version['id']):
@@ -695,25 +702,6 @@ class VersionsHandler(BaseHandler):
 
     return new_version
 
-  def begin_deploy(self, project_id, service_id, version_id):
-    """ Triggers the deployment process.
-
-    Args:
-      project_id: A string specifying a project ID.
-      service_id: A string specifying a service ID.
-      version_id: A string specifying a version ID.
-    Raises:
-      CustomHTTPError if unable to start the deployment process.
-    """
-    version_key = VERSION_PATH_SEPARATOR.join(
-      [project_id, service_id, version_id])
-
-    try:
-      self.acc.update([version_key])
-    except AppControllerException as error:
-      message = 'Error while updating version: {}'.format(error)
-      raise CustomHTTPError(HTTPCodes.INTERNAL_ERROR, message=message)
-
   @gen.coroutine
   def identify_as_hoster(self, project_id, service_id, version):
     """ Marks this machine as having a version's source code.
@@ -793,6 +781,20 @@ class VersionsHandler(BaseHandler):
       project_id: A string specifying a project ID.
       service_id: A string specifying a service ID.
     """
+
+    if not self.PROJECT_ID_RE.match(project_id):
+      raise CustomHTTPError(HTTPCodes.BAD_REQUEST,
+                            message='Invalid project ID. '
+                                    'It must be 6 to 30 lowercase letters, digits, '
+                                    'or hyphens. It must start with a letter.')
+
+    if not self.SERVICE_ID_RE.match(service_id):
+      raise CustomHTTPError(HTTPCodes.BAD_REQUEST,
+                            message='Invalid service ID. '
+                                    'May only contain lowercase letters, digits, '
+                                    'and hyphens. Must begin and end with a letter '
+                                    'or digit. Must not exceed 63 characters.')
+
     self.authenticate(project_id, self.ua_client)
     version = self.version_from_payload()
 
@@ -827,16 +829,14 @@ class VersionsHandler(BaseHandler):
 
     self.clean_up_revision_nodes(project_id, service_id, version)
     utils.remove_old_archives(project_id, service_id, version)
-    self.begin_deploy(project_id, service_id, version['id'])
 
     operation = CreateVersionOperation(project_id, service_id, version)
     operations[operation.id] = operation
 
     pre_wait = REDEPLOY_WAIT if version_exists else 0
-    logging.debug(
+    logger.debug(
       'Starting operation {} in {}s'.format(operation.id, pre_wait))
-    IOLoop.current().call_later(pre_wait, wait_for_deploy, operation.id,
-                                self.acc)
+    IOLoop.current().call_later(pre_wait, wait_for_deploy, operation.id)
 
     self.write(json_encode(operation.rest_repr()))
 
@@ -1306,7 +1306,7 @@ def main():
     return
 
   if args.verbose:
-    logger.setLevel(logging.DEBUG)
+    logging.getLogger('appscale').setLevel(logging.DEBUG)
 
   options.define('secret', appscale_info.get_secret())
   options.define('login_ip', appscale_info.get_login_ip())
@@ -1339,15 +1339,16 @@ def main():
 
   app = web.Application([
     ('/oauth/token', OAuthHandler, {'ua_client': ua_client}),
-    ('/v1/apps/([a-z0-9-]+)/services/([a-z0-9-]+)/versions', VersionsHandler,
-     all_resources),
+    ('/v1/apps/([^/]*)/services/([^/]*)/versions', VersionsHandler,
+     {'ua_client': ua_client, 'zk_client': zk_client,
+      'version_update_lock': version_update_lock, 'thread_pool': thread_pool}),
     ('/v1/projects', ProjectsHandler, all_resources),
     ('/v1/projects/([a-z0-9-]+)', ProjectHandler, all_resources),
-    ('/v1/apps/([a-z0-9-]+)/services/([a-z0-9-]+)', ServiceHandler,
+    ('/v1/apps/([^/]*)/services/([^/]*)', ServiceHandler,
      all_resources),
-    ('/v1/apps/([a-z0-9-]+)/services/([a-z0-9-]+)/versions/([a-z0-9-]+)',
+    ('/v1/apps/([^/]*)/services/([^/]*)/versions/([^/]*)',
      VersionHandler, all_resources),
-    ('/v1/apps/([a-z0-9-]+)/operations/([a-z0-9-]+)', OperationsHandler,
+    ('/v1/apps/([^/]*)/operations/([a-z0-9-]+)', OperationsHandler,
      {'ua_client': ua_client}),
     ('/api/cron/update', UpdateCronHandler,
      {'acc': acc, 'zk_client': zk_client, 'ua_client': ua_client}),
