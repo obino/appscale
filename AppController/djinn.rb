@@ -5110,7 +5110,7 @@ HOSTS
                         "AppServers (#{max}).")
       end
     elsif num_appservers + appservers_to_scale < min
-      appservers_to_scale = num_appservers - min
+      appservers_to_scale = min - num_appservers
       if appservers_to_scale.zero?
         Djinn.log_debug("#{version_key} has reached the minimum number of allowed " \
                         "AppServers (#{max}).")
@@ -5129,13 +5129,10 @@ HOSTS
       end
     end
 
-    # Finally we have to ensure we have at least the minimum number of
-    # AppServers required.
-    if num_appservers + appservers_to_scale < min
-      Djinn.log_info(
-        "#{version_key} needs #{min - num_appservers} more AppServers.")
+    # If we are below the minimum, we fast-track the scaling up.
+    if num_appservers < min
+      Djinn.log_info("#{version_key} is below minimum number of AppServers.")
       @last_decision[version_key] = 0
-      appservers_to_scale = [min - num_appservers, appservers_to_scale].max
     end
 
     return appservers_to_scale
