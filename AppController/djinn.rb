@@ -5284,10 +5284,8 @@ HOSTS
           next if node['private_ip'] != host
 
           load_now = Float(node['loadavg']['last_1_min']) / node['cpu']['count']
-          if load_now >= MAX_LOAD_AVG
-            Djinn.log_debug("Database at #{host} has normalized load of #{load_now}.")
-            high_load = load_now if load_now > high_load
-          end
+          Djinn.log_debug("Database at #{host} has normalized load of #{load_now}.")
+          high_load = load_now if load_now > high_load
         }
       }
     }
@@ -5295,9 +5293,9 @@ HOSTS
     # The remove about 10% of AppServers for loads above the maximum up to
     # 2x the maximum, 50% for higher loads.
     delta_appservers = 0
-    if high_load > 0 && high_load > MAX_LOAD_AVG && high_load < MAX_LOAD_AVG * 2
+    if high_load > MAX_LOAD_AVG && high_load < MAX_LOAD_AVG * 2
       delta_appservers = -1 * Integer(num_appservers * 0.1)
-    elsif high_load > 0 && high_load >= MAX_LOAD_AVG * 2
+    elsif high_load >= MAX_LOAD_AVG * 2
       delta_appservers = -1 * Integer(num_appservers * 0.5)
     end
 
