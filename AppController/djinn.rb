@@ -5055,7 +5055,7 @@ HOSTS
     return min, max
   end
 
-  # Finds the limits of the autoscaling for the specific application.
+  # Find the desired delta in appservers for a specific application.
   # Args:
   #   version_details: the version of the running application
   # Returns:
@@ -5076,8 +5076,8 @@ HOSTS
 
     Djinn.log_debug("Evaluating #{version_key} for scaling.")
 
-    # Find out the current number of AppServers dedicated to the
-    # application.
+    # Find out the current number of AppServers dedicated (both running
+    # and pending) to the application.
     num_appservers = 0
     unless @app_info_map[version_key]['appservers'].nil?
       num_appservers = @app_info_map[version_key]['appservers'].length
@@ -5089,39 +5089,35 @@ HOSTS
       time_requests_were_seen = get_application_load_stats(version_key)
 
     # If we don't receive good stats about the application, we'll skip
-    # this round of scaling logic, but we still need to enfoce system
+    # this round of scaling logic, but we still need to enforce system
     # limits, like the minimum number of AppServers.
     appservers_to_scale = 0
-    if time_requests_were_seen == :no_stats
-      Djinn.log_warn("Didn't see any request data - not sure whether to scale up or down.")
-    else
+    unless time_requests_were_seen == :no_stats
       update_request_info(version_key, total_requests_seen,
                           time_requests_were_seen, total_req_in_queue)
-
-      # Check the current load (in term of requests serviced) on the
-      # AppServers.
-      allow_concurrency = version_details.fetch('threadsafe', true)
-      current_load = calculate_current_load(num_appservers, current_sessions,
-                                            allow_concurrency)
 
       # If 'autoscale' is disabled, we go through the system check, and obey
       # to the minimum number of AppServers but we do no other scaling.
       if @options['autoscale'].downcase == "true"
+        # Check the current load (in term of requests serviced) on the
+        # AppServers.
+        allow_concurrency = version_details.fetch('threadsafe', true)
+        current_load = calculate_current_load(num_appservers, current_sessions,
+                                            allow_concurrency)
+
         # Calculate the desired (as a difference) number of AppServers for
         # the application.
         appservers_to_scale = calculate_appservers_needed(
           num_appservers, current_sessions, allow_concurrency)
-      end
 
-      # Now what we have the optimal number of AppServers the application
-      # would like, we look into the current load of the application: if it
-      # is already in the sweet spot, we let it be.
-      if current_load < MAX_LOAD_THRESHOLD && current_load > MIN_LOAD_THRESHOLD
-        appservers_to_scale = 0
+        if current_load.between?(MIN_LOAD_THRESHOLD, MAX_LOAD_THRESHOLD)
+          # If load is already in the sweet spot, let it be.
+         appservers_to_scale = 0
+        end
       end
     end
 
-    # Services need will override the applicaiton desires, in order to
+    # Services needs will override the application desires, in order to
     # avoid overloading.
     delta = check_services_load(version_key, num_appservers)
     appservers_to_scale = delta if delta < 0
@@ -5318,10 +5314,10 @@ HOSTS
       }
     }
 
-    # The remove about 10% of AppServers for loads above the maximum up to
-    # 2x the maximum, 50% for higher loads.
+    # We remove about 10% of AppServers for loads above the maximum up to
+    # 2x the maximum load, 50% for higher loads.
     delta_appservers = 0
-    if high_load > MAX_LOAD_AVG && high_load < MAX_LOAD_AVG * 2
+    if high_load.between?(MAX_LOAD_AVG, MAX_LOAD_AVG * 2)
       delta_appservers = -1 * Integer(num_appservers * 0.1)
     elsif high_load >= MAX_LOAD_AVG * 2
       delta_appservers = -1 * Integer(num_appservers * 0.5)
@@ -5893,7 +5889,8 @@ HOSTS
         sessions += load_stats[2]
         time = Time.now.to_i
       rescue AppScaleException => error
-        Djinn.log_warn("Couldn't get proxy stats from Hermes: #{error.message}")
+        Djinn.log_warn("Couldn't get proxy stats for #{version_key} from " \
+                       "Hermes (it may prevent scaling): #{error.message}")
       end
     }
     if lb_nodes.length > 1
