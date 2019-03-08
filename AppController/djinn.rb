@@ -4449,7 +4449,7 @@ HOSTS
   # Deploy the dashboard by making a request to the AdminServer.
   def deploy_dashboard(source_archive)
     # Allow fewer dashboard instances for small deployments.
-    min_dashboards = [3, get_all_compute_nodes.length].min
+    min_dashboards = [2, get_all_compute_nodes.length].min
 
     archive_md5 = Digest::MD5.file(source_archive).hexdigest
 
@@ -4933,6 +4933,13 @@ HOSTS
 
           hosted_apps = []
           @versions_loaded.each { |version_key|
+            # If we have only a Dashboard running on the node, we don't
+            # count it as used, unless it is the only one.
+            project_id, _, _ = version_key.split(VERSION_PATH_SEPARATOR)
+            if project_id == AppDashboard::APP_NAME
+              next if @app_info_map[version_key]['appservers'].length > 1
+            end
+
             @app_info_map[version_key]['appservers'].each { |location|
               host, port = location.split(":")
               if host == node.private_ip
