@@ -923,6 +923,14 @@ class Djinn
   def set_parameters(layout, options, secret)
     return BAD_SECRET_MSG unless valid_secret?(secret)
 
+    # set_parameters can be called only once when the deployment is
+    # started.
+    if File.exists?(ZK_LOCATIONS_FILE)
+      Djinn.log_warn("set_parameters was called but we already" \
+          " have a zookeeper configuration.")
+      return INVALID_REQUEST
+    end
+
     # options is a JSON string that will be loaded into a Hash.
     if options.class != String
       msg = "Error: options wasn't a String, but was a " +
@@ -1672,7 +1680,7 @@ class Djinn
 
     # If deprecated ZK_LOCATIONS_JSON_FILE is used,
     # convert it to regular ZK_LOCATIONS_FILE
-    if not File.exists?(ZK_LOCATIONS_FILE) and File.exists?(ZK_LOCATIONS_JSON_FILE)
+    if !File.exists?(ZK_LOCATIONS_FILE) && File.exists?(ZK_LOCATIONS_JSON_FILE)
       # Read deprecated json file with zookeeper nodes.
       zookeeper_data = HelperFunctions.read_json_file(ZK_LOCATIONS_JSON_FILE)
       HelperFunctions.write_file(ZK_LOCATIONS_FILE, zookeeper_data['locations'].join("\n"))
