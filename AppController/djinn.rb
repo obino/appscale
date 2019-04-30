@@ -128,6 +128,9 @@ MIN_LOAD_THRESHOLD = 0.7
 # The exit code that indicates the data layout version is unexpected.
 INVALID_VERSION_EXIT_CODE = 64
 
+# Maximum AppServer threaded connections
+MAX_APPSERVER_CONN = 7
+
 # Djinn (interchangeably known as 'the AppController') automatically
 # configures and deploys all services for a single node. It relies on other
 # Djinns or the AppScale Tools to tell it what services (roles) it should
@@ -4741,6 +4744,9 @@ HOSTS
     if @app_info_map[version_key]['appservers'].nil?
       @app_info_map[version_key]['appservers'] = []
     end
+    if @app_info_map[version_key]['idle'].nil?
+      @app_info_map[version_key]['idle'] = []
+    end
     Djinn.log_debug("setup_appengine_version: info for #{version_key}: " \
                     "#{@app_info_map[version_key]}.")
 
@@ -4816,25 +4822,45 @@ HOSTS
     unless @app_info_map[version_key].key?('appservers')
       @app_info_map[version_key]['appservers'] = []
     end
+    unless @app_info_map[version_key].key?('idle')
+      @app_info_map[version_key]['idle'] = []
+    end
     known_instances = @app_info_map[version_key]['appservers']
+    idle_instances = @app_info_map[version_key]['idle']
 
     # Replace instance assignments with any new registered instances.
     zk_instances.each { |instance_key|
       next if known_instances.include?(instance_key)
+      next if idle_instances.include?(instance_key)
 
-      # Find and remove an entry for this AppServer node and app.
+      # Find and remove a pending entry for this AppServer node and app.
       ip = instance_key.split(':')[0]
       match = known_instances.index("#{ip}:-1")
       if match
         known_instances.delete_at(match)
         known_instances << instance_key
-      else
-        Djinn.log_warn("Ignoring unassigned instance: #{instance_key}.")
+        next
       end
+
+      # If we didn't find a match for running instances, we look into
+      # the idle list.
+      match = idle_instances.index("#{ip}:-1")
+      if match
+        idle_instances.delete_at(match)
+        idle_instances << instance_key
+        next
+      end
+
+      Djinn.log_warn("Ignoring unassigned instance: #{instance_key}.")
     }
 
     # Account for instances that have been stopped.
     known_instances.delete_if { |instance_key|
+      pending = instance_key.split(':')[-1] == '-1'
+      registered = zk_instances.include?(instance_key)
+      !pending && !registered
+    }
+    idle_instances.delete_if { |instance_key|
       pending = instance_key.split(':')[-1] == '-1'
       registered = zk_instances.include?(instance_key)
       !pending && !registered
@@ -5073,17 +5099,22 @@ HOSTS
     @initialized_versions[version_key] = true
   end
 
-  # Get the effective min/max instances for a version
+  # Get the scaling parameters of a module, in particular
+  # [min|max]Instances, [min|max]TotalInstances, [min|mx]IdleInstances and
+  # maxConcurrentRequests. Other parameters are currently unsupported.
   #
   # Args:
   #   version_details: The version details from zookeeper
-  def get_min_max_from_version_details(version_details)
+  # Returns:
+  #   min, max, min_idle, max_idle, concurrency: A tuple with the min/max
+  #       and concurrency values.
+  def scaling_options_for_version(version_details)
+    min = max = min_idle = max_idle = 0
+    concurrency = MAX_APPSERVER_CONN
+
     manual_scaling = version_details.fetch('manualScaling', {})
     if manual_scaling.fetch('instances', nil)
-      if version_details.fetch('servingStatus', 'SERVING') == 'STOPPED'
-        min = 0
-        max = 0
-      else
+      if version_details.fetch('servingStatus', 'SERVING') != 'STOPPED'
         min = manual_scaling.fetch('instances')
         max = min
       end
@@ -5102,8 +5133,11 @@ HOSTS
                                  Integer(@options['default_min_appservers']))
       max = min_max_params.fetch(max_param,
                                  Integer(@options['default_max_appservers']))
+      min_idle = min_max_params.fetch('minIdleInstances', 0)
+      max_idle = min_max_params.fetch('maxIdleInstances', 0)
+      concurrency = min_max_params.fetch('maConcurrentRequests', concurrency)
     end
-    return min, max
+    return min, max, min_idle, max_idle, concurrency
   end
 
   # Queries haproxy to see how many requests are queued for a given version
@@ -5125,7 +5159,7 @@ HOSTS
                      'hosting it anymore.')
       return 0
     end
-    min, max = get_min_max_from_version_details(version_details)
+    min, max, _, _, concurrency = scaling_options_for_version(version_details)
 
     # Let's make sure we have the minimum number of AppServers running.
     Djinn.log_debug("Evaluating #{version_key} for scaling.")
@@ -5179,28 +5213,35 @@ HOSTS
     Djinn.log_debug("Using #{scale_sessions} as current_sessions value " \
                     "for scaling #{version_key}.")
 
+    # Override concurrency level if the app is not threadsafe.
     allow_concurrency = version_details.fetch('threadsafe', true)
-    current_load = calculate_current_load(num_appservers, scale_sessions,
-                                          allow_concurrency)
+    concurrency = 1 unless allow_concurrency
+
+    # Calculates the current load of the deployment based on the number of
+    # running AppServers, its max allowed threaded connections and current
+    # handled sessions.
+    # Formula: Load = Current Sessions / (No of AppServers * Max conn)
+    current_load = scale_session.to_f / (num_appservers * concurrency)
+
+    # Calculates the additional number of AppServers needed to be scaled up in
+    # order achieve the desired load.
+    # Formula: No of AppServers = Current sessions / (Load * Max conn)
+    desired_appservers = scale_session.to_f / (DESIRED_LOAD * concurrency)
+
     if current_load >= MAX_LOAD_THRESHOLD
       if num_appservers == max
         Djinn.log_info("Reached maximum allowed number of AppServers " \
                        "for #{version_key}.")
         return 0
       end
-      appservers_to_scale = calculate_appservers_needed(
-          num_appservers, scale_sessions, allow_concurrency)
 
       # Let's make sure we don't get over the user define maximum.
-      if num_appservers + appservers_to_scale > max
-        appservers_to_scale = max - num_appservers
-      end
-
+      appservers_to_scale = desired_appservers - num_appservers
+      appservers_to_scale = max - num_appservers if desired_appservers > max
       Djinn.log_debug("The deployment has reached its maximum load " \
                       "threshold for #{version_key} - Advising that we " \
                       "scale up #{appservers_to_scale} AppServers.")
       return appservers_to_scale
-
     elsif current_load <= MIN_LOAD_THRESHOLD
       downscale_cooldown = SCALEDOWN_THRESHOLD * DUTY_CYCLE
       if Time.now.to_i - @last_decision[version_key] < downscale_cooldown
@@ -5208,8 +5249,15 @@ HOSTS
           "Not enough time has passed to scale down #{version_key}")
         return 0
       end
-      appservers_to_scale = calculate_appservers_needed(
-          num_appservers, scale_sessions, allow_concurrency)
+      if num_appservers == min
+        Djinn.log_debug("We are already at the minimum number of " \
+                        "AppServers for #{version_key}.")
+        return 0
+      end
+
+      # Let's make sure we don't get over the user define minimum.
+      appservers_to_scale = desired_appservers - num_appservers
+      appservers_to_scale = min - num_appservers if desired_appservers < min
       Djinn.log_debug("The deployment is below its minimum load threshold " \
                       "for #{version_key} - Advising that we scale down " \
                       "#{appservers_to_scale.abs} AppServers.")
@@ -5220,43 +5268,6 @@ HOSTS
                       "to scale currently.")
       return 0
     end
-  end
-
-  # Calculates the current load of the deployment based on the number of
-  # running AppServers, its max allowed threaded connections and current
-  # handled sessions.
-  # Formula: Load = Current Sessions / (No of AppServers * Max conn)
-  #
-  # Args:
-  #   num_appservers: The total number of AppServers running for the app.
-  #   curr_sessions: The number of current sessions from HAProxy stats.
-  #   allow_concurrency: A boolean indicating that AppServers can handle
-  #     concurrent connections.
-  # Returns:
-  #   A decimal indicating the current load.
-  def calculate_current_load(num_appservers, curr_sessions, allow_concurrency)
-    max_connections = allow_concurrency ? HAProxy::MAX_APPSERVER_CONN : 1
-    max_sessions = num_appservers * max_connections
-    return curr_sessions.to_f / max_sessions
-  end
-
-  # Calculates the additional number of AppServers needed to be scaled up in
-  # order achieve the desired load.
-  # Formula: No of AppServers = Current sessions / (Load * Max conn)
-  #
-  # Args:
-  #   num_appservers: The total number of AppServers running for the app.
-  #   curr_sessions: The number of current sessions from HAProxy stats.
-  #   allow_concurrency: A boolean indicating that AppServers can handle
-  #     concurrent connections.
-  # Returns:
-  #   A number indicating the number of additional AppServers to be scaled up.
-  def calculate_appservers_needed(num_appservers, curr_sessions,
-                                  allow_concurrency)
-    max_conn = allow_concurrency ? HAProxy::MAX_APPSERVER_CONN : 1
-    desired_appservers = curr_sessions.to_f / (DESIRED_LOAD * max_conn)
-    appservers_to_scale = desired_appservers.ceil - num_appservers
-    return appservers_to_scale
   end
 
   # Updates internal state about the number of requests seen for the given
@@ -5370,17 +5381,31 @@ HOSTS
     # Prioritize machines that aren't serving the version.
     current_hosts = get_hosts_for_version(version_key)
 
-    # Get the memory limit for this application.
+    # Get the memory limit and the scaling info for this application.
     project_id, service_id, version_id = version_key.split(
       VERSION_PATH_SEPARATOR)
     begin
       version_details = ZKInterface.get_version_details(
         project_id, service_id, version_id)
+      _, _, min_idle = scaling_options_for_version(version_details)
     rescue VersionNotFound
       Djinn.log_info("Not scaling #{version_key} because it no longer exists")
       return false
     end
 
+    # Use idle instances to scale up if they are available.
+    @state_change_lock.synchronize {
+      unless @app_info_map[version_key]['idle'].nil?
+        delta_appservers.downto(1) { |delta|
+          break unless @app_info_map[version_key]['idle'][0]
+          @app_info_map[version_key]['appservers'] <<
+              @app_info_map[version_key]['idle'][0]
+          @app_info_map[version_key]['idle'].delete_at(0)
+        }
+      end
+    }
+
+    # Find out how much memory per AppServer the application requires.
     max_app_mem = Integer(@options['default_max_appserver_memory'])
     if version_details.key?('instanceClass')
       instance_class = version_details['instanceClass'].to_sym
@@ -5443,7 +5468,10 @@ HOSTS
       if available_hosts.empty?
         Djinn.log_info(
           "No compute node is available to scale #{version_key}.")
-        return delta
+
+        # Since we have exhausted all idle instances, we need to add them
+        # to the requests of instances still needed.
+        return delta + min_idle
       end
 
       appserver_to_use = nil
@@ -5468,11 +5496,28 @@ HOSTS
       @app_info_map[version_key]['appservers'] << "#{appserver_to_use}:-1"
     }
 
+    # Now let's make sure we have enough idle instances as per the
+    # application request.
+    if  min_idle > @app_info_map[vesion_key]['idle'].length
+      min_idle - @app_info_map[vesion_key]['idle'].length.downto(1) { |delta|
+        if available_hosts.empty?
+          Djinn.log_info("No compute node is available to host idle " \
+                         "instances for #{version_key}.")
+          return delta
+        end
+
+        appserver_to_use = available_hosts.sample
+        available_hosts.delete_at(available_hosts.index(appserver_to_use))
+        Djinn.log_info("Adding a new idle AppServer on #{appserver_to_use} " \
+                       "for #{version_key}.")
+        @app_info_map[version_key]['idle'] << "#{appserver_to_use}:-1"
+      }
+    end
+
     # We started all desired AppServers.
     @last_decision[version_key] = Time.now.to_i
     return 0
   end
-
 
   # Try to remove an AppServer for the specified version, ensuring
   # that a minimum number of AppServers is always kept. We remove
@@ -5491,21 +5536,10 @@ HOSTS
     begin
       version_details = ZKInterface.get_version_details(
         project_id, service_id, version_id)
-      min, max = get_min_max_from_version_details(version_details)
+      min = scaling_options_for_version(version_details)
     rescue VersionNotFound
       min = 0
     end
-
-    if @app_info_map[version_key]['appservers'].length <= min
-      Djinn.log_debug("We are already at the minimum number of AppServers " \
-                      "for #{version_key}.")
-      return false
-    end
-
-    # Make sure we leave at least the minimum number of AppServers
-    # running.
-    max_delta = @app_info_map[version_key]['appservers'].length - min
-    num_to_remove = [delta_appservers, max_delta].min
 
     # We first remove AppServers that may not have yet started: this
     # is important to guarantee the minimum number of AppServers will hold
@@ -5513,9 +5547,9 @@ HOSTS
     # are at least old ones running).
     to_delete = []
     get_all_compute_nodes.reverse_each { |node_ip|
-      break if num_to_remove == to_delete.length
+      break if delta_appservers == to_delete.length
       @app_info_map[version_key]['appservers'].each { |location|
-        break if num_to_remove == to_delete.length
+        break if delta_appservers == to_delete.length
 
         host, port = location.split(":")
         to_delete << location if host == node_ip && Integer(port) < 0
@@ -5526,9 +5560,9 @@ HOSTS
     # remove the AppServer there, so we can try to reclaim it once it's
     # unloaded.
     get_all_compute_nodes.reverse_each { |node_ip|
-      break if num_to_remove == to_delete.length
+      break if delta_appservers == to_delete.length
       @app_info_map[version_key]['appservers'].each { |location|
-        break if num_to_remove == to_delete.length
+        break if delta_appservers == to_delete.length
 
         host, _ = location.split(":")
         to_delete << location if host == node_ip

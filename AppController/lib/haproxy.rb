@@ -38,9 +38,6 @@ module HAProxy
   BASE_CONFIG_FILE = File.join(HAPROXY_PATH, "app-base.#{CONFIG_EXTENSION}")
   PIDFILE = '/var/run/app-haproxy.pid'.freeze
 
-  # Maximum AppServer threaded connections
-  MAX_APPSERVER_CONN = 7
-
   # The first port that haproxy will bind to for App Engine apps.
   START_PORT = 10000
 
