@@ -660,7 +660,8 @@ class InstanceManager(object):
       controller_state: A dictionary containing controller state.
     """
     def version_assignments(data):
-      return [int(server.split(':')[1]) for server in data['appservers']
+      active_list = data['appservers'] + data['idle']
+      return [int(server.split(':')[1]) for server in active_list
               if server.split(':')[0] == self._private_ip]
 
     return {

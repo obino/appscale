@@ -5133,9 +5133,9 @@ HOSTS
                                  Integer(@options['default_min_appservers']))
       max = min_max_params.fetch(max_param,
                                  Integer(@options['default_max_appservers']))
-      min_idle = min_max_params.fetch('minIdleInstances', 0)
-      max_idle = min_max_params.fetch('maxIdleInstances', 0)
-      concurrency = min_max_params.fetch('maConcurrentRequests', concurrency)
+      min_idle = scaling_params.fetch('minIdleInstances', 0)
+      max_idle = scaling_params.fetch('maxIdleInstances', 0)
+      concurrency = scaling_params.fetch('maConcurrentRequests', concurrency)
     end
     return min, max, min_idle, max_idle, concurrency
   end
@@ -5226,7 +5226,7 @@ HOSTS
     # Calculates the additional number of AppServers needed to be scaled up in
     # order achieve the desired load.
     # Formula: No of AppServers = Current sessions / (Load * Max conn)
-    desired_appservers = scale_sessioasn.to_f / (DESIRED_LOAD * concurrency)
+    desired_appservers = scale_sessions.to_f / (DESIRED_LOAD * concurrency)
 
     if current_load >= MAX_LOAD_THRESHOLD
       if num_appservers == max
@@ -5396,12 +5396,17 @@ HOSTS
     # Use idle instances to scale up if they are available.
     @state_change_lock.synchronize {
       unless @app_info_map[version_key]['idle'].nil?
+        idle_fulfilled = 0
         delta_appservers.downto(1) { |delta|
           break unless @app_info_map[version_key]['idle'][0]
           @app_info_map[version_key]['appservers'] <<
               @app_info_map[version_key]['idle'][0]
+          Djinn.log_debug("Using idle instance for #{version_key} " \
+                          "(#{@app_info_map[version_key]['idle'][0]})")
           @app_info_map[version_key]['idle'].delete_at(0)
+          idle_fulfilled += 1
         }
+        delta_appservers -= idle_fulfilled
       end
     }
 
@@ -5499,7 +5504,7 @@ HOSTS
     # Now let's make sure we have enough idle instances as per the
     # application request.
     if  min_idle > @app_info_map[version_key]['idle'].length
-      min_idle - @app_info_map[version_key]['idle'].length.downto(1) { |delta|
+      (min_idle - @app_info_map[version_key]['idle'].length).downto(1) { |delta|
         if available_hosts.empty?
           Djinn.log_info("No compute node is available to host idle " \
                          "instances for #{version_key}.")

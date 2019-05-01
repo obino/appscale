@@ -1028,10 +1028,10 @@ class VersionHandler(BaseVersionHandler):
       scheduler_fields['maxInstances'] = max_instances
 
     if min_idle_instances is not None:
-      scheduler_fields['minIdleInstances'] = min_idle_instances
+      new_fields['automaticScaling']['minIdleInstances'] = min_idle_instances
 
     if max_idle_instances is not None:
-      scheduler_fields['maxIdleInstances'] = max_idle_instances
+      new_fields['automaticScaling']['maxIdleInstances'] = max_idle_instances
 
     yield self.thread_pool.submit(self.version_update_lock.acquire)
     try:
@@ -1149,16 +1149,14 @@ class VersionHandler(BaseVersionHandler):
         project_id, service_id, version_id, new_http_port, new_https_port)
 
     automatic_scaling = version.get('automaticScaling', {})
+    new_min_idle_instances = automatic_scaling.get('minIdleInstances', None)
+    new_max_idle_instances = automatic_scaling.get('maxIdleInstances', None)
     standard_settings = automatic_scaling.get(
       'standardSchedulerSettings', {})
     if ('minInstances' in standard_settings or
-        'maxInstances' in standard_settings or
-        'minIdleInstances' in standard_settings or
-        'maxIdleInstances' in standard_settings):
+        'maxInstances' in standard_settings)
       new_min_instances = standard_settings.get('minInstances', None)
       new_max_instances = standard_settings.get('maxInstances', None)
-      new_min_idle_instances = standard_settings.get('minIdleInstances', None)
-      new_max_idle_instances = standard_settings.get('maxIdleInstances', None)
       version = yield self.update_scaling_for_version(
         project_id, service_id, version_id, new_min_instances,
         new_max_instances,new_min_idle_instances, new_max_idle_instances)
