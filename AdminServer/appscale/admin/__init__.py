@@ -1015,7 +1015,7 @@ class VersionHandler(BaseVersionHandler):
       min_instances: An integer specifying minimum instances.
       max_instances: An integer specifying maximum instances.
       min_idle_instances: An integer specifying minimum idle instances.
-      max__idle_instances: An integer specifying maximum idle instances.
+      max_idle_instances: An integer specifying maximum idle instances.
     Returns:
       A dictionary containing completed version details.
     """
@@ -1154,7 +1154,7 @@ class VersionHandler(BaseVersionHandler):
     standard_settings = automatic_scaling.get(
       'standardSchedulerSettings', {})
     if ('minInstances' in standard_settings or
-        'maxInstances' in standard_settings)
+        'maxInstances' in standard_settings):
       new_min_instances = standard_settings.get('minInstances', None)
       new_max_instances = standard_settings.get('maxInstances', None)
       version = yield self.update_scaling_for_version(
