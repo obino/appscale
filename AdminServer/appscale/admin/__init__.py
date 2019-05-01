@@ -883,12 +883,18 @@ class VersionHandler(BaseVersionHandler):
       'appscaleExtensions.httpsPort',
       'automaticScaling.standard_scheduler_settings.max_instances',
       'automaticScaling.standard_scheduler_settings.min_instances',
+      'automaticScaling.standard_scheduler_settings.min_idle_instances',
+      'automaticScaling.standard_scheduler_settings.max_idle_instances',
       'servingStatus'}
     mapped_fields = {
       'automaticScaling.standard_scheduler_settings.max_instances':
         'automaticScaling.standardSchedulerSettings.maxInstances',
       'automaticScaling.standard_scheduler_settings.min_instances':
-        'automaticScaling.standardSchedulerSettings.minInstances'}
+        'automaticScaling.standardSchedulerSettings.minInstances',
+      'automaticScaling.standard_scheduler_settings.min_idle_instances':
+        'automaticScaling.standardSchedulerSettings.minIdleInstances',
+      'automaticScaling.standard_scheduler_settings.max_idle_instances':
+        'automaticScaling.standardSchedulerSettings.maxIdleInstances'}
     for field in desired_fields:
       if field not in supported_fields:
         message = ('This operation is only supported on the following '
@@ -998,7 +1004,8 @@ class VersionHandler(BaseVersionHandler):
 
   @gen.coroutine
   def update_scaling_for_version(self, project_id, service_id, version_id,
-                                 min_instances, max_instances):
+                                 min_instances, max_instances,
+                                 min_idle_instances, max_idle_instances):
     """ Updates scaling settings for a version.
 
     Args:
@@ -1007,6 +1014,8 @@ class VersionHandler(BaseVersionHandler):
       version_id: A string specifying a version ID.
       min_instances: An integer specifying minimum instances.
       max_instances: An integer specifying maximum instances.
+      min_idle_instances: An integer specifying minimum idle instances.
+      max__idle_instances: An integer specifying maximum idle instances.
     Returns:
       A dictionary containing completed version details.
     """
@@ -1017,6 +1026,12 @@ class VersionHandler(BaseVersionHandler):
 
     if max_instances is not None:
       scheduler_fields['maxInstances'] = max_instances
+
+    if min_idle_instances is not None:
+      scheduler_fields['minIdleInstances'] = min_idle_instances
+
+    if max_idle_instances is not None:
+      scheduler_fields['maxIdleInstances'] = max_idle_instances
 
     yield self.thread_pool.submit(self.version_update_lock.acquire)
     try:
@@ -1137,12 +1152,16 @@ class VersionHandler(BaseVersionHandler):
     standard_settings = automatic_scaling.get(
       'standardSchedulerSettings', {})
     if ('minInstances' in standard_settings or
-        'maxInstances' in standard_settings):
+        'maxInstances' in standard_settings or
+        'minIdleInstances' in standard_settings or
+        'maxIdleInstances' in standard_settings):
       new_min_instances = standard_settings.get('minInstances', None)
       new_max_instances = standard_settings.get('maxInstances', None)
+      new_min_idle_instances = standard_settings.get('minIdleInstances', None)
+      new_max_idle_instances = standard_settings.get('maxIdleInstances', None)
       version = yield self.update_scaling_for_version(
         project_id, service_id, version_id, new_min_instances,
-        new_max_instances)
+        new_max_instances,new_min_idle_instances, new_max_idle_instances)
 
     serving_status = version.get('servingStatus', None)
     if serving_status:

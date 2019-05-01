@@ -5221,12 +5221,12 @@ HOSTS
     # running AppServers, its max allowed threaded connections and current
     # handled sessions.
     # Formula: Load = Current Sessions / (No of AppServers * Max conn)
-    current_load = scale_session.to_f / (num_appservers * concurrency)
+    current_load = scale_sessions.to_f / (num_appservers * concurrency)
 
     # Calculates the additional number of AppServers needed to be scaled up in
     # order achieve the desired load.
     # Formula: No of AppServers = Current sessions / (Load * Max conn)
-    desired_appservers = scale_session.to_f / (DESIRED_LOAD * concurrency)
+    desired_appservers = scale_sessioasn.to_f / (DESIRED_LOAD * concurrency)
 
     if current_load >= MAX_LOAD_THRESHOLD
       if num_appservers == max
@@ -5498,8 +5498,8 @@ HOSTS
 
     # Now let's make sure we have enough idle instances as per the
     # application request.
-    if  min_idle > @app_info_map[vesion_key]['idle'].length
-      min_idle - @app_info_map[vesion_key]['idle'].length.downto(1) { |delta|
+    if  min_idle > @app_info_map[version_key]['idle'].length
+      min_idle - @app_info_map[version_key]['idle'].length.downto(1) { |delta|
         if available_hosts.empty?
           Djinn.log_info("No compute node is available to host idle " \
                          "instances for #{version_key}.")
