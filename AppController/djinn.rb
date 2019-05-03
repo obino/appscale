@@ -5017,6 +5017,12 @@ HOSTS
                 hosted_apps << "#{version_key}:#{port}"
               end
             }
+            @app_info_map[version_key]['idle'].each { |location|
+              host, port = location.split(":")
+              if host == node.private_ip
+                hosted_apps << "#{version_key}:#{port}"
+              end
+            }
           }
 
           unless hosted_apps.empty?
@@ -5561,18 +5567,6 @@ HOSTS
   # Returns:
   #   A boolean indicating if an AppServer was removed.
   def try_to_scale_down(version_key, delta_appservers)
-    project_id, service_id, version_id = version_key.split(
-      VERSION_PATH_SEPARATOR)
-    # See how many AppServers are running on each machine. We cannot scale
-    # if we already are at the requested minimum.
-    begin
-      version_details = ZKInterface.get_version_details(
-        project_id, service_id, version_id)
-      min = scaling_options_for_version(version_details)
-    rescue VersionNotFound
-      min = 0
-    end
-
     # We first remove AppServers that may not have yet started: this
     # is important to guarantee the minimum number of AppServers will hold
     # even in the event that new AppServers fails to start (assuming there
