@@ -60,11 +60,22 @@ class VersionRoutingManager(object):
 
   @gen.coroutine
   def _update_instances(self, instances):
-    """ Handles changes to list of registered instances.
+    """ Handles changes to list of registered instances minus the idle
+    instances which doesn't need to be routed.
 
     Args:
       versions: A list of strings specifying registered instances.
     """
+    controller_state = {}
+    try:
+      encoded_state = self._zk_client.get(CONTROLLER_STATE_NODE)
+      controller_state = json.loads(encoded_state[0])
+      for idle in controller_state['@app_info_map'][self._version_key]['idle']:
+        if idle in instances:
+          instances.remove(idle)
+    except (TypeError, ValueError):
+      logger.warning('Faulty controller state: {}'.format(controller_state))
+
     self._instances = instances
     yield self._update_version_block()
 
