@@ -35,6 +35,7 @@ class VersionRoutingManager(object):
     self._version_key = version_key
     self._haproxy = haproxy
     self._instances = []
+    self._idle_instances = []
     self._port = None
     self._max_connections = None
     self._zk_client = zk_client
@@ -42,6 +43,9 @@ class VersionRoutingManager(object):
     instances_node = '/'.join([VERSION_REGISTRATION_NODE, self._version_key])
     self._zk_client.ensure_path(instances_node)
     self._zk_client.ChildrenWatch(instances_node, self._update_instances_watch)
+
+    self._zk_client.DataWatch(CONTROLLER_STATE_NODE,
+                              self._controller_state_watch)
 
     project_id, service_id, version_id = self._version_key.split(
       VERSION_PATH_SEPARATOR)
@@ -59,23 +63,52 @@ class VersionRoutingManager(object):
     yield self._update_version_block()
 
   @gen.coroutine
+  def _update_controller_state(self, encoded_controller_state):
+    """ Handles updates to controller state.
+
+    Args:
+      encoded_controller_state: A JSON-encoded string containing controller
+        state.
+    """
+    if not encoded_controller_state:
+      return
+
+    controller_state = {}
+    idle = []
+    try:
+      controller_state = json.loads(encoded_controller_state)
+      idle = controller_state['@app_info_map'][self._version_key]['idle']
+    except (TypeError, ValueError):
+      logger.warning('Faulty controller state: {}'.format(controller_state))
+
+    if idle == self._idle_instances:
+      return
+
+    logger.info("Got new idle instances for {}: {}.".format(
+        self._version_key, idle))
+
+    self._idle_instances = idle
+    yield self._update_version_block()
+
+  def _controller_state_watch(self, encoded_controller_state, _):
+    """ Handles updates to controller state.
+
+    Args:
+      encoded_controller_state: A JSON-encoded string containing controller
+        state.
+    """
+    persistent_update_controller_state = retry_data_watch_coroutine(
+      CONTROLLER_STATE_NODE, self._update_controller_state)
+    IOLoop.instance().add_callback(
+      persistent_update_controller_state, encoded_controller_state)
+
+  @gen.coroutine
   def _update_instances(self, instances):
-    """ Handles changes to list of registered instances minus the idle
-    instances which doesn't need to be routed.
+    """ Handles changes to list of registered instances.
 
     Args:
       versions: A list of strings specifying registered instances.
     """
-    controller_state = {}
-    try:
-      encoded_state = self._zk_client.get(CONTROLLER_STATE_NODE)
-      controller_state = json.loads(encoded_state[0])
-      for idle in controller_state['@app_info_map'][self._version_key]['idle']:
-        if idle in instances:
-          instances.remove(idle)
-    except (TypeError, ValueError):
-      logger.warning('Faulty controller state: {}'.format(controller_state))
-
     self._instances = instances
     yield self._update_version_block()
 
@@ -137,6 +170,12 @@ class VersionRoutingManager(object):
     haproxy_app_version = self._haproxy.versions[self._version_key]
     haproxy_app_version.port = self._port
     haproxy_app_version.max_connections = self._max_connections
+
+    # Do not route idle instances.
+    for idle in self._idle_instances:
+      if idle in self._instances:
+        self._instances.remove(idle)
+
     haproxy_app_version.servers = self._instances
     yield self._haproxy.reload()
 
