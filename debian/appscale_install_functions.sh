@@ -366,14 +366,13 @@ postinstallcassandra()
 
 installservice()
 {
-    # This must be absolute path of runtime.
-    mkdir -pv ${DESTDIR}/etc/init.d/
-    cp ${APPSCALE_HOME_RUNTIME}/AppController/scripts/appcontroller ${DESTDIR}/etc/init.d/appscale-controller
-    chmod -v a+x ${DESTDIR}/etc/init.d/appscale-controller
+    # Remove the old script.
+    update-rc.d -f appscale-controller remove
+    rm -f /etc/init.d/appscale-controller
 
-    # Make sure the init script runs each time, so that it can start the
-    # AppController on system reboots.
-    update-rc.d -f appscale-controller defaults
+    # Install the new systemd configuration.
+    cp ${APPSCALE_HOME_RUNTIME}/AppController/templates/appscale-controller.service ${DESTDIR}/etc/systemd/sytem/appscale-controller.service
+    systemctl daemon-reload
 
     # Prevent monit from immediately restarting services at boot.
     cp ${APPSCALE_HOME}/AppController/scripts/appscale-unmonit.sh \

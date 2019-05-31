@@ -411,7 +411,7 @@ class Djinn
   NO_ZOOKEEPER_CONNECTION = 'No Zookeeper available: in isolated mode'.freeze
 
   # Where to put logs.
-  LOG_FILE = '/var/log/appscale/controller-17443.log'.freeze
+  LOG_FILE = '/var/log/appscale/controller.log'.freeze
 
   # Default memory to allocate to each AppServer.
   DEFAULT_MEMORY = 400
@@ -521,7 +521,8 @@ class Djinn
     # methods exposed via SOAP.
     @@secret = HelperFunctions.get_secret
 
-    @@log = Logger.new(STDOUT)
+    file = File.open(LOG_FILE, File::WRONLY | File::APPEND)
+    @@log = Logger.new(file)
     @@log.level = Logger::INFO
 
     @my_index = nil
@@ -1746,10 +1747,10 @@ class Djinn
     initialize_server
     start_stop_api_services
 
-    # Now that we are done loading, we can set the monit job to check the
-    # AppController. At this point we are resilient to failure (ie the AC
-    # will restart if needed).
-    set_appcontroller_monit
+    # Now that we are done loading, we can set the AppController to be
+    # started at boot. At this point we are resilient to failure (ie the
+    # AC will restart if needed).
+    start_appcontroller_at_boot
     @done_loading = true
 
     pick_zookeeper(@zookeeper_data)
@@ -4224,29 +4225,16 @@ class Djinn
     }
   end
 
-  def set_appcontroller_monit
-    Djinn.log_debug("Configuring AppController monit.")
-    service = `which service`.chomp
-    start_cmd = "#{service} appscale-controller start"
-    pidfile = '/var/run/appscale/controller.pid'
-    stop_cmd = "/sbin/start-stop-daemon --stop --pidfile #{pidfile} --retry=TERM/30/KILL/5"
-
-    # Let's make sure we don't have 2 roles monitoring the controller.
-    FileUtils.rm_rf("/etc/monit/conf.d/controller-17443.cfg")
-
-    begin
-      MonitInterface.start_daemon(:controller, start_cmd, stop_cmd, pidfile)
-    rescue
-      Djinn.log_warn("Failed to set local AppController monit: retrying.")
-      retry
-    end
+  def start_appcontroller_at_boot
+    Djinn.log_debug("Configuring AppController to start at boot.")
+    Djinn.log_run("systemctl enable appscale-controller")
   end
 
   def start_appcontroller(node)
     ip = node.private_ip
 
     # Start the AppController on the remote machine.
-    remote_cmd = "/usr/sbin/service appscale-controller start"
+    remote_cmd = "systemctl start appscale-controller"
     tries = RETRIES
     begin
       result = HelperFunctions.run_remote_command(ip, remote_cmd, node.ssh_key, true)

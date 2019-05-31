@@ -1,0 +1,19 @@
+[Unit]
+Description=AppScale Controller
+Documentation=http://appscale.com/try-appscale
+
+[Service]
+Type=simple
+PIDFile=/var/run/appscale/controller.pid
+ExecStart=/root/appscale/AppController/djinnServer.rb
+Restart=on-failure
+
+# Make sure we have a secret.key before starting the controller. If not,
+# the tools will need to do an 'up' first.
+ExecStartPre=/usr/bin/test -e /etc/appscale/secret.key
+ExecStartPre=/bin/mkdir -p /var/run/appscale
+
+PermissionsStartOnly=true
+User=root
+Group=root
+
