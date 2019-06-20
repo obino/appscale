@@ -145,11 +145,6 @@ server = DjinnServer.new(
   :SSLCertName => nil
 )
 
-trap('TERM') {
-  Djinn.log_debug("Received TERM signal: stopping AppController.")
-  server.shutdown
-}
-
 new_thread = Thread.new { run_server(server) }
 server.djinn.job_start(secret)
 new_thread.join()
