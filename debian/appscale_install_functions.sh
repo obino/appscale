@@ -279,6 +279,8 @@ installgems()
     # proxies. This is at this time used mostly on AppScale QA system.
     unset http_proxy
     unset HTTP_PROXY
+    unset https_proxy
+    unset HTTPS_PROXY
 
     GEMOPT="--no-rdoc --no-ri "
 
