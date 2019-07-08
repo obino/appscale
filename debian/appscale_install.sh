@@ -33,7 +33,6 @@ case "$1" in
         installappscaleprofile
         . /etc/profile.d/appscale.sh
         upgradepip
-        installgems
         postinstallhaproxy
         postinstallnginx
         installjavajdk
@@ -71,5 +70,8 @@ case "$1" in
         preplogserver
         prepdashboard
         fetchclientjars
+
+        # Need to be the last one since we unset the proxy.
+        installgems
         ;;
 esac

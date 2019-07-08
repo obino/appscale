@@ -275,32 +275,23 @@ postinstallhaproxy()
 
 installgems()
 {
-    GEMOPT="--no-rdoc --no-ri"
+    # TODO: need to find a better way to get gem to work correctly with
+    # proxies. This is at this time used mostly on AppScale QA system.
+    unset http_proxy
+    unset HTTP_PROXY
 
-    # Rake >= 12.3.0 requires Ruby >= 2.
-    ruby_major_version=$(ruby --version | awk '{print $2}' | head -c 1)
-    if [ "${ruby_major_version}" -lt "2" ]; then
-        gem install rake ${GEMOPT} -v 12.2.1
-    else
-        gem install rake ${GEMOPT}
-    fi
+    GEMOPT="--no-rdoc --no-ri "
 
-    sleep 1
+    gem install rake ${GEMOPT}
     if [ "${UNAME_MACHINE}" = "x86_64" ]; then
-        gem install zookeeper
+        gem install zookeeper ${GEMOPT}
     else
         # The current zookeeper gem has x86-specific assembly code.
         CUSTOM_ZK_GEM="zookeeper-1.4.11.gem"
         cachepackage ${CUSTOM_ZK_GEM} 2117f0814722715a3c765211842337eb
         gem install --local ${PACKAGE_CACHE}/${CUSTOM_ZK_GEM}
     fi
-    sleep 1
-    if [ "${ruby_major_version}" -lt "2" ]; then
-        gem install json ${GEMOPT} -v 1.8.3
-    else
-        gem install json ${GEMOPT}
-    fi
-    sleep 1
+    gem install json ${GEMOPT}
     gem install soap4r-ng ${GEMOPT} -v 2.0.3
     gem install httparty ${GEMOPT} -v 0.14.0
     gem install httpclient ${GEMOPT}
