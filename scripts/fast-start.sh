@@ -282,8 +282,16 @@ fi
 KEYNAME=$(grep keyname "${HOME}/AppScalefile" | cut -f 2 -d ":")
 [ -z "${KEYNAME}" ] && { echo "Cannot discover keyname: is AppScale deployed?" ; exit 1 ; }
 
-# Deploy sample app.
-${APPSCALE_CMD} deploy ${GUESTBOOK_APP}
+# Deploy sample app. On a single node, possibly limited in memory, there
+# is chance of the operation failing for taking too ling: we retries few
+# times to give it a chance of success.
+for x in {1..3}; do
+  if ${APPSCALE_CMD} deploy ${GUESTBOOK_APP} ; then
+    break
+  fi
+  echo "Retrying redploy sample application."
+  sleep 3
+done
 
 # Relocate to port 80.
 ${APPSCALE_CMD} relocate guestbook 80 443
